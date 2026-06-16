@@ -161,7 +161,7 @@ func (ph *ProxyHandler) handleChatCompletions(w http.ResponseWriter, r *http.Req
 			return
 		}
 
-		keyState.RegisterRequest(time.Now())
+		// GetBestKey already reserved (registered) this key atomically.
 		ph.pool.SyncKeyToDB(keyState)
 
 		log.Printf("[Attempt %d/%d] Proxying %s -> %s using key %s", attempt, ph.cfg.MaxKeyRetries, originalModel, resolvedModel, keyState.MaskedKey)

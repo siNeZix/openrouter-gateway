@@ -132,7 +132,8 @@ func (s *Store) migrate() error {
 		}
 	}
 
-	// Migrations: Add raw_key to existing tables if it does not exist
+	// Migration for databases created before raw_key existed in the CREATE above.
+	// On fresh DBs the column already exists, so this errors and is ignored.
 	_, _ = s.db.Exec(`ALTER TABLE keys ADD COLUMN raw_key TEXT NOT NULL DEFAULT '';`)
 
 	return nil
@@ -200,21 +201,6 @@ func (s *Store) UpdateKey(k *DBKey) error {
 	`, k.Status, k.LimitRemaining, k.UsageToday, k.MaxLimit,
 		k.IsFreeTier, k.RateLimitReq, k.RateLimitInterval,
 		k.CooldownUntil, k.LastCheckedAt, k.LastUsedAt, k.KeyHash)
-	return err
-}
-
-func (s *Store) UpdateKeyLastUsed(hash string, lastUsed time.Time) error {
-	_, err := s.db.Exec(`UPDATE keys SET last_used_at = ? WHERE key_hash = ?`, lastUsed, hash)
-	return err
-}
-
-func (s *Store) UpdateKeyCooldown(hash string, cooldownUntil time.Time) error {
-	_, err := s.db.Exec(`UPDATE keys SET cooldown_until = ? WHERE key_hash = ?`, cooldownUntil, hash)
-	return err
-}
-
-func (s *Store) UpdateKeyStatus(hash string, status string) error {
-	_, err := s.db.Exec(`UPDATE keys SET status = ? WHERE key_hash = ?`, status, hash)
 	return err
 }
 
@@ -342,10 +328,10 @@ func (s *Store) GetGeneralStats() (*GeneralStats, error) {
 	err := s.db.QueryRow(`
 		SELECT 
 			COUNT(*),
-			SUM(CASE WHEN status='active' THEN 1 ELSE 0 END),
-			SUM(CASE WHEN status='rate_limited' OR status='day_exhausted' THEN 1 ELSE 0 END),
-			SUM(CASE WHEN status='invalid' THEN 1 ELSE 0 END),
-			SUM(CASE WHEN status='unchecked' THEN 1 ELSE 0 END)
+			COALESCE(SUM(CASE WHEN status='active' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status='rate_limited' OR status='day_exhausted' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status='invalid' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status='unchecked' THEN 1 ELSE 0 END), 0)
 		FROM keys
 	`).Scan(&stats.TotalKeys, &stats.ActiveKeys, &stats.BlockedKeys, &stats.InvalidKeys, &stats.UncheckedKeys)
 	if err != nil {
@@ -358,7 +344,9 @@ func (s *Store) GetGeneralStats() (*GeneralStats, error) {
 		return nil, err
 	}
 
-	todayStart := time.Now().Truncate(24 * time.Hour)
+	// Local midnight, matching the per-key daily reset (KeyState.ResetDailyUsageIfNewDay).
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	err = s.db.QueryRow(`SELECT COUNT(*) FROM requests WHERE timestamp >= ?`, todayStart).Scan(&stats.TodayRequests)
 	if err != nil {
 		return nil, err

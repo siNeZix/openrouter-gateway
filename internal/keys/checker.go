@@ -163,6 +163,15 @@ func (kc *KeyChecker) CheckKey(ks *KeyState) {
 	}
 	defer resp.Body.Close()
 
+	// Decode the body BEFORE taking the lock so we never hold ks.mu across I/O.
+	var keyResp OpenRouterKeyResponse
+	if resp.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(resp.Body).Decode(&keyResp); err != nil {
+			log.Printf("Failed to decode key response for %s: %v", masked, err)
+			return
+		}
+	}
+
 	ks.mu.Lock()
 	defer func() {
 		ks.LastCheckedAt = now
@@ -172,20 +181,9 @@ func (kc *KeyChecker) CheckKey(ks *KeyState) {
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		var keyResp OpenRouterKeyResponse
-		if err := json.NewDecoder(resp.Body).Decode(&keyResp); err != nil {
-			log.Printf("Failed to decode key response for %s: %v", masked, err)
-			return
-		}
-
 		// Update state with server data
 		if keyResp.Data.Limit != nil {
 			ks.MaxLimit = *keyResp.Data.Limit
-		}
-		if keyResp.Data.Usage != nil {
-			// Calculate usage_today in our system by comparing change or using absolute if we want.
-			// OpenRouter returns total usage on the key.
-			// Let's store limit remaining and compute usage accordingly.
 		}
 		if keyResp.Data.LimitRemaining != nil {
 			ks.LimitRemaining = *keyResp.Data.LimitRemaining

@@ -1,0 +1,14 @@
+services:
+  gateway:
+    image: ghcr.io/sinezix/openrouter-gateway:latest
+    container_name: openrouter-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - gateway-data:/data
+
+volumes:
+  gateway-data:

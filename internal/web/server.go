@@ -2,6 +2,7 @@ package web
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"html/template"
 	"log"
 	"net/http"
@@ -42,6 +43,7 @@ func NewWebServer(cfg *config.Config, s *store.Store, rm *models.RankingManager,
 
 func (ws *WebServer) Start(mux *http.ServeMux) {
 	mux.HandleFunc("/", ws.basicAuth(ws.handleDashboard))
+	mux.HandleFunc("/api/stats", ws.basicAuth(ws.handleAPIStats))
 	mux.HandleFunc("/keys/add", ws.basicAuth(ws.handleKeysAdd))
 	mux.HandleFunc("/keys/delete", ws.basicAuth(ws.handleKeysDelete))
 }
@@ -112,6 +114,12 @@ func (ws *WebServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			}
 			return (float64(part) / float64(total)) * 100
 		},
+		"percentageInt": func(part, total int) float64 {
+			if total == 0 {
+				return 0
+			}
+			return (float64(part) / float64(total)) * 100
+		},
 		"cooldownLeft": func(t time.Time) string {
 			if t.Before(time.Now()) {
 				return ""
@@ -152,6 +160,112 @@ func (ws *WebServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if err := tmpl.Execute(w, data); err != nil {
 		log.Printf("Failed to render dashboard: %v", err)
 	}
+}
+
+func (ws *WebServer) handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	general, err := ws.store.GetGeneralStats()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	modelsStats, err := ws.store.GetModelStats()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	keyStats, err := ws.store.GetKeyUsageStats()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	topModels := ws.rankingMgr.GetTopModels()
+
+	// Format cooldown durations for JSON response
+	type CustomKeyStats struct {
+		MaskedKey     string    `json:"masked_key"`
+		KeyHash       string    `json:"key_hash"`
+		Status        string    `json:"status"`
+		TodayUsage    int64     `json:"today_usage"`
+		Limit         int64     `json:"limit"`
+		TotalRequests int64     `json:"total_requests"`
+		ErrorRequests int64     `json:"error_requests"`
+		CooldownLeft  string    `json:"cooldown_left"`
+		FormattedLast string    `json:"formatted_last"`
+	}
+
+	customKeys := make([]CustomKeyStats, len(keyStats))
+	for i, k := range keyStats {
+		left := ""
+		if k.CooldownUntil.After(time.Now()) {
+			left = time.Until(k.CooldownUntil).Truncate(time.Second).String()
+		}
+		formattedLast := "never"
+		if !k.CooldownUntil.IsZero() && k.CooldownUntil.Unix() > 0 {
+			formattedLast = k.CooldownUntil.Format("15:04:05")
+		}
+		customKeys[i] = CustomKeyStats{
+			MaskedKey:     k.MaskedKey,
+			KeyHash:       k.KeyHash,
+			Status:        k.Status,
+			TodayUsage:    k.TodayUsage,
+			Limit:         k.Limit,
+			TotalRequests: k.TotalRequests,
+			ErrorRequests: k.ErrorRequests,
+			CooldownLeft:  left,
+			FormattedLast: formattedLast,
+		}
+	}
+
+	type CustomGeneralStats struct {
+		TotalRequests int64 `json:"total_requests"`
+		TodayRequests int64 `json:"today_requests"`
+		ActiveKeys    int   `json:"active_keys"`
+		BlockedKeys   int   `json:"blocked_keys"`
+		InvalidKeys   int   `json:"invalid_keys"`
+		UncheckedKeys int   `json:"unchecked_keys"`
+		TotalKeys     int   `json:"total_keys"`
+	}
+
+	customGeneral := CustomGeneralStats{
+		TotalRequests: general.TotalRequests,
+		TodayRequests: general.TodayRequests,
+		ActiveKeys:    general.ActiveKeys,
+		BlockedKeys:   general.BlockedKeys,
+		InvalidKeys:   general.InvalidKeys,
+		UncheckedKeys: general.UncheckedKeys,
+		TotalKeys:     general.TotalKeys,
+	}
+
+	type CustomModelStats struct {
+		Model         string `json:"model"`
+		TotalRequests int64  `json:"total_requests"`
+		AvgLatencyMs  int64  `json:"avg_latency_ms"`
+		TotalTokens   int64  `json:"total_tokens"`
+	}
+
+	customModels := make([]CustomModelStats, len(modelsStats))
+	for i, m := range modelsStats {
+		customModels[i] = CustomModelStats{
+			Model:         m.Model,
+			TotalRequests: m.TotalRequests,
+			AvgLatencyMs:  m.AvgLatencyMs,
+			TotalTokens:   m.TotalTokens,
+		}
+	}
+
+	res := map[string]interface{}{
+		"general":      customGeneral,
+		"models":       customModels,
+		"keys":         customKeys,
+		"top_models":   topModels,
+		"refreshed_at": time.Now().Format("15:04:05 (02.01.2006)"),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
 }
 
 func (ws *WebServer) handleKeysAdd(w http.ResponseWriter, r *http.Request) {
@@ -230,12 +344,136 @@ const dashboardTemplate = `
         body { font-family: 'Inter', sans-serif; }
     </style>
     <script>
-        setInterval(() => {
-            const textarea = document.getElementById('keys-textarea');
-            if (!textarea || (document.activeElement !== textarea && textarea.value.trim() === '')) {
-                window.location.reload();
+        async function updateStats() {
+            try {
+                const textarea = document.getElementById('keys-textarea');
+                if (textarea && document.activeElement === textarea && textarea.value.trim() !== '') {
+                    return; // Don't interrupt when typing keys
+                }
+
+                const res = await fetch('/api/stats');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                // Update updated time
+                const refTime = document.getElementById('refreshed-at');
+                if (refTime) refTime.textContent = data.refreshed_at;
+
+                // Update general stats
+                const totalReqs = document.getElementById('total-requests');
+                if (totalReqs) totalReqs.textContent = data.general.total_requests;
+                const todayReqs = document.getElementById('today-requests');
+                if (todayReqs) todayReqs.textContent = data.general.today_requests;
+
+                const activeKeys = document.getElementById('active-keys');
+                if (activeKeys) activeKeys.textContent = data.general.active_keys + ' / ' + data.general.total_keys;
+                const activeBar = document.getElementById('active-bar');
+                if (activeBar) activeBar.style.width = (data.general.total_keys > 0 ? (data.general.active_keys / data.general.total_keys * 100) : 0) + '%';
+
+                const blockedKeys = document.getElementById('blocked-keys');
+                if (blockedKeys) blockedKeys.textContent = data.general.blocked_keys;
+                const blockedBar = document.getElementById('blocked-bar');
+                if (blockedBar) blockedBar.style.width = (data.general.total_keys > 0 ? (data.general.blocked_keys / data.general.total_keys * 100) : 0) + '%';
+
+                const invalidKeys = document.getElementById('invalid-keys');
+                if (invalidKeys) invalidKeys.textContent = data.general.invalid_keys;
+                const uncheckedKeys = document.getElementById('unchecked-keys');
+                if (uncheckedKeys) uncheckedKeys.textContent = data.general.unchecked_keys;
+
+                // Update models usage stats table
+                const modelBody = document.getElementById('model-stats-body');
+                if (modelBody) {
+                    if (data.models && data.models.length > 0) {
+                        modelBody.innerHTML = data.models.map(m => {
+                            const modelShort = m.model.split('/').pop() || m.model;
+                            return "" +
+                               "<tr class=\"hover:bg-slate-750 transition\">" +
+                                   "<td class=\"px-4 py-3 font-semibold text-white\">" +
+                                       modelShort +
+                                       "<span class=\"block text-[10px] font-mono text-slate-500 font-normal mt-0.5\">" + m.model + "</span>" +
+                                   "</td>" +
+                                   "<td class=\"px-4 py-3 text-center text-slate-300 font-mono font-medium\">" + m.total_requests + "</td>" +
+                                   "<td class=\"px-4 py-3 text-center text-amber-400 font-mono\">" + m.avg_latency_ms + " ms</td>" +
+                                   "<td class=\"px-4 py-3 text-center text-slate-400 font-mono\">" + m.total_tokens + "</td>" +
+                               "</tr>";
+                        }).join('');
+                    } else {
+                        modelBody.innerHTML = "" +
+                            "<tr>" +
+                                "<td colspan=\"4\" class=\"px-4 py-8 text-center text-slate-400\">Лог запросов пуст. Сделайте первый запрос через прокси!</td>" +
+                            "</tr>";
+                    }
+                }
+
+                // Update keys usage table
+                const keyBody = document.getElementById('key-stats-body');
+                if (keyBody) {
+                    if (data.keys && data.keys.length > 0) {
+                        keyBody.innerHTML = data.keys.map(k => {
+                            let statusBadge = '';
+                            if (k.status === 'active') {
+                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>';
+                            } else if (k.status === 'rate_limited') {
+                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">COOLDOWN</span>';
+                            } else if (k.status === 'day_exhausted') {
+                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">EXHAUSTED</span>';
+                            } else if (k.status === 'invalid') {
+                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-slate-700/30 text-slate-500 border border-slate-700/50">INVALID</span>';
+                            } else {
+                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20">UNCHECKED</span>';
+                            }
+
+                            const limitText = k.limit <= 0 ? "<span class=\"text-slate-500\">unknown</span>" : 
+                                ("<span class=\"" + (k.limit <= 10 ? "text-rose-400 font-semibold" : "text-slate-300") + "\">" + k.limit + "</span>");
+
+                            const errPercent = k.total_requests > 0 ? (k.error_requests / k.total_requests * 100) : 0;
+                            const errText = k.total_requests > 0 ? 
+                                ("<span class=\"font-mono " + (errPercent > 10.0 ? "text-rose-400 font-semibold" : "text-slate-400") + "\">" + errPercent.toFixed(1) + "%</span>") : 
+                                "<span class=\"text-slate-500\">-</span>";
+
+                            return "" +
+                                "<tr class=\"hover:bg-slate-750 transition\">" +
+                                    "<td class=\"px-4 py-3 font-mono text-xs text-slate-300 font-medium\">" +
+                                        "<span title=\"" + k.key_hash + "\">" + k.masked_key + "</span>" +
+                                    "</td>" +
+                                    "<td class=\"px-4 py-3 text-xs\">" +
+                                        statusBadge +
+                                    "</td>" +
+                                    "<td class=\"px-4 py-3 text-center font-mono font-medium text-white\">" + k.today_usage + "</td>" +
+                                    "<td class=\"px-4 py-3 text-center font-mono\">" +
+                                        limitText +
+                                    "</td>" +
+                                    "<td class=\"px-4 py-3 text-center font-mono text-slate-400\">" + k.total_requests + "</td>" +
+                                    "<td class=\"px-4 py-3 text-center text-xs\">" +
+                                        errText +
+                                    "</td>" +
+                                    "<td class=\"px-4 py-3 text-center text-xs font-mono text-amber-400\">" +
+                                        k.cooldown_left +
+                                    "</td>" +
+                                     "<td class=\"px-4 py-3 text-center text-xs text-slate-400\">" +
+                                        k.formatted_last +
+                                     "</td>" +
+                                     "<td class=\"px-4 py-3 text-center\">" +
+                                         "<form action=\"/keys/delete\" method=\"POST\" onsubmit=\"return confirm('Вы уверены, что хотите удалить этот ключ?');\" class=\"inline\">" +
+                                             "<input type=\"hidden\" name=\"hash\" value=\"" + k.key_hash + "\">" +
+                                             "<button type=\"submit\" class=\"text-rose-500 hover:text-rose-400 font-bold px-2 py-1 hover:bg-rose-500/10 rounded transition text-xs\">🗑️ Удалить</button>" +
+                                         "</form>" +
+                                     "</td>" +
+                                "</tr>";
+                        }).join('');
+                    } else {
+                        keyBody.innerHTML = "" +
+                            "<tr>" +
+                                "<td colspan=\"9\" class=\"px-4 py-8 text-center text-slate-400\">Нет загруженных ключей в пуле.</td>" +
+                            "</tr>";
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to auto update stats:', err);
             }
-        }, 10000);
+        }
+
+        setInterval(updateStats, 5000);
     </script>
 </head>
 <body class="h-full text-slate-100 flex flex-col">
@@ -255,7 +493,7 @@ const dashboardTemplate = `
                     <code class="text-emerald-400 font-mono ml-1">{{.Token}}</code>
                 </div>
                 <div class="bg-slate-900 px-3 py-1.5 rounded-md border border-slate-700 text-xs text-slate-400">
-                    Обновлено: <strong class="text-white">{{.RefreshedAt}}</strong> (авто-обновление 10с)
+                    Обновлено: <strong id="refreshed-at" class="text-white">{{.RefreshedAt}}</strong> (авто-обновление 5с)
                 </div>
             </div>
         </div>
@@ -269,8 +507,8 @@ const dashboardTemplate = `
             <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-sm flex items-center justify-between">
                 <div>
                     <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Всего запросов</p>
-                    <h3 class="text-2xl font-bold text-white mt-1">{{.GeneralStats.TotalRequests}}</h3>
-                    <p class="text-xs text-slate-400 mt-1">Сегодня: <strong class="text-emerald-400">{{.GeneralStats.TodayRequests}}</strong></p>
+                    <h3 id="total-requests" class="text-2xl font-bold text-white mt-1">{{.GeneralStats.TotalRequests}}</h3>
+                    <p class="text-xs text-slate-400 mt-1">Сегодня: <strong id="today-requests" class="text-emerald-400">{{.GeneralStats.TodayRequests}}</strong></p>
                 </div>
                 <div class="text-4xl">⚡</div>
             </div>
@@ -279,9 +517,9 @@ const dashboardTemplate = `
             <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-sm flex items-center justify-between">
                 <div>
                     <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Активные ключи</p>
-                    <h3 class="text-2xl font-bold text-emerald-400 mt-1">{{.GeneralStats.ActiveKeys}} / {{.GeneralStats.TotalKeys}}</h3>
+                    <h3 id="active-keys" class="text-2xl font-bold text-emerald-400 mt-1">{{.GeneralStats.ActiveKeys}} / {{.GeneralStats.TotalKeys}}</h3>
                     <div class="w-24 bg-slate-700 h-1.5 rounded-full mt-2 overflow-hidden">
-                        <div class="bg-emerald-400 h-full" style="width: {{percentage (int64 .GeneralStats.ActiveKeys) (int64 .GeneralStats.TotalKeys)}}%"></div>
+                        <div id="active-bar" class="bg-emerald-400 h-full" style="width: {{percentageInt .GeneralStats.ActiveKeys .GeneralStats.TotalKeys}}%"></div>
                     </div>
                 </div>
                 <div class="text-4xl">🔑</div>
@@ -291,9 +529,9 @@ const dashboardTemplate = `
             <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-sm flex items-center justify-between">
                 <div>
                     <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">В лимите / Cooldown</p>
-                    <h3 class="text-2xl font-bold text-amber-500 mt-1">{{.GeneralStats.BlockedKeys}}</h3>
+                    <h3 id="blocked-keys" class="text-2xl font-bold text-amber-500 mt-1">{{.GeneralStats.BlockedKeys}}</h3>
                     <div class="w-24 bg-slate-700 h-1.5 rounded-full mt-2 overflow-hidden">
-                        <div class="bg-amber-500 h-full" style="width: {{percentage (int64 .GeneralStats.BlockedKeys) (int64 .GeneralStats.TotalKeys)}}%"></div>
+                        <div id="blocked-bar" class="bg-amber-500 h-full" style="width: {{percentageInt .GeneralStats.BlockedKeys .GeneralStats.TotalKeys}}%"></div>
                     </div>
                 </div>
                 <div class="text-4xl">⏳</div>
@@ -303,8 +541,8 @@ const dashboardTemplate = `
             <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-sm flex items-center justify-between">
                 <div>
                     <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Невалидные / Ошибки</p>
-                    <h3 class="text-2xl font-bold text-rose-500 mt-1">{{.GeneralStats.InvalidKeys}}</h3>
-                    <p class="text-xs text-slate-400 mt-1">Непроверенные: <strong class="text-blue-400">{{.GeneralStats.UncheckedKeys}}</strong></p>
+                    <h3 id="invalid-keys" class="text-2xl font-bold text-rose-500 mt-1">{{.GeneralStats.InvalidKeys}}</h3>
+                    <p class="text-xs text-slate-400 mt-1">Непроверенные: <strong id="unchecked-keys" class="text-blue-400">{{.GeneralStats.UncheckedKeys}}</strong></p>
                 </div>
                 <div class="text-4xl">❌</div>
             </div>
@@ -367,7 +605,7 @@ const dashboardTemplate = `
                                 <th class="px-4 py-3 text-center">Токены</th>
                             </tr>
                         </thead>
-                        <tbody class="divide-y divide-slate-700">
+                        <tbody id="model-stats-body" class="divide-y divide-slate-700">
                             {{range .ModelStats}}
                             <tr class="hover:bg-slate-750 transition">
                                 <td class="px-4 py-3 font-semibold text-white">
@@ -433,7 +671,7 @@ const dashboardTemplate = `
                             <th class="px-4 py-3 text-center">Действие</th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y divide-slate-700">
+                    <tbody id="key-stats-body" class="divide-y divide-slate-700">
                         {{range .KeyStats}}
                         <tr class="hover:bg-slate-750 transition">
                             <td class="px-4 py-3 font-mono text-xs text-slate-300 font-medium">

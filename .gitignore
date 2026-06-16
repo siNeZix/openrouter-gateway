@@ -15,6 +15,7 @@ gateway
 
 # Private keys (CRITICAL FOR SECURITY)
 accounts/api_keys.txt
+.env
 
 # OS/IDEs
 .idea/

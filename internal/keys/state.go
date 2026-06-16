@@ -1,6 +1,7 @@
 package keys
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -88,38 +89,19 @@ func (ks *KeyState) ResetDailyUsageIfNewDay() bool {
 	return false
 }
 
-// CleanOldRequests cleans up history older than 1 minute
+// cleanOldRequests drops timestamps older than 1 minute. Caller holds ks.mu.
 func (ks *KeyState) cleanOldRequests(now time.Time) {
 	threshold := now.Add(-time.Minute)
-	validIdx := 0
-	for i, t := range ks.RequestTimes {
-		if t.After(threshold) {
-			validIdx = i
-			break
-		}
-		if i == len(ks.RequestTimes)-1 {
-			// all are old
-			ks.RequestTimes = ks.RequestTimes[:0]
-			return
-		}
-	}
-	if validIdx > 0 {
-		ks.RequestTimes = ks.RequestTimes[validIdx:]
-	}
+	ks.RequestTimes = slices.DeleteFunc(ks.RequestTimes, func(t time.Time) bool {
+		return !t.After(threshold)
+	})
 }
 
-// CanUse checks if the key is allowed to make a request right now
-func (ks *KeyState) CanUse(now time.Time) bool {
-	ks.mu.Lock()
-	defer ks.mu.Unlock()
-
-	// Check calendar day reset
+// usable reports whether the key may serve a request now. Caller holds ks.mu.
+func (ks *KeyState) usable(now time.Time) bool {
 	ks.ResetDailyUsageIfNewDay()
 
-	if ks.Status == "invalid" {
-		return false
-	}
-	if ks.Status == "day_exhausted" {
+	if ks.Status == "invalid" || ks.Status == "day_exhausted" {
 		return false
 	}
 	if ks.CooldownUntil.After(now) {
@@ -128,23 +110,44 @@ func (ks *KeyState) CanUse(now time.Time) bool {
 
 	ks.cleanOldRequests(now)
 
-	// Check if minute limit exceeded (default 20 requests/min if zero/unset)
+	// Default 20 requests/min if the per-key limit is unknown.
 	limit := ks.RateLimitReq
 	if limit <= 0 {
 		limit = 20
 	}
-	if len(ks.RequestTimes) >= limit {
-		return false
-	}
-
-	return true
+	return len(ks.RequestTimes) < limit
 }
 
-// RegisterRequest increments usage and records request timestamp for rate limiting
-func (ks *KeyState) RegisterRequest(now time.Time) {
+// CanUse checks if the key is allowed to make a request right now.
+func (ks *KeyState) CanUse(now time.Time) bool {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	return ks.usable(now)
+}
+
+// TryReserve atomically checks usability and, if usable, registers the request.
+// Returns false without mutating if the key cannot be used. This closes the
+// select-then-use race between GetBestKey and RegisterRequest.
+func (ks *KeyState) TryReserve(now time.Time) bool {
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
 
+	if !ks.usable(now) {
+		return false
+	}
+	ks.registerLocked(now)
+	return true
+}
+
+// RegisterRequest increments usage and records request timestamp for rate limiting.
+func (ks *KeyState) RegisterRequest(now time.Time) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	ks.registerLocked(now)
+}
+
+// registerLocked performs the request accounting. Caller holds ks.mu.
+func (ks *KeyState) registerLocked(now time.Time) {
 	ks.ResetDailyUsageIfNewDay()
 
 	ks.UsageToday++

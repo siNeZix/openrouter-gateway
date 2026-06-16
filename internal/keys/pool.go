@@ -109,7 +109,9 @@ func (kp *KeyPool) RemoveKey(hash string) error {
 	return kp.Load()
 }
 
-// GetBestKey implements smart selection: least used today, not in cooldown, fits minute limit
+// GetBestKey selects the usable key with the least usage today and atomically
+// reserves it (registers the request) before returning, so two concurrent
+// callers can never hand out the same slot and overrun the per-key minute limit.
 func (kp *KeyPool) GetBestKey() (*KeyState, error) {
 	kp.mu.RLock()
 	defer kp.mu.RUnlock()
@@ -119,37 +121,35 @@ func (kp *KeyPool) GetBestKey() (*KeyState, error) {
 	}
 
 	now := time.Now()
-	var best *KeyState
 
-	for _, k := range kp.keys {
-		if !k.CanUse(now) {
-			continue
+	// ponytail: O(n) scan + reservation retry on contention. Fine for a few
+	// thousand keys; switch to a usage-ordered heap if selection shows up hot.
+	tried := make(map[*KeyState]bool)
+	for {
+		var best *KeyState
+		var bestUsage int64
+		for _, k := range kp.keys {
+			if tried[k] || !k.CanUse(now) {
+				continue
+			}
+			k.mu.Lock()
+			usage := k.UsageToday
+			k.mu.Unlock()
+			if best == nil || usage < bestUsage {
+				best, bestUsage = k, usage
+			}
 		}
 
 		if best == nil {
-			best = k
-			continue
+			return nil, fmt.Errorf("all keys are rate limited, exhausted or in cooldown (pool size: %d)", len(kp.keys))
 		}
 
-		// Pick key with least usage today
-		best.mu.Lock()
-		bestUsage := best.UsageToday
-		best.mu.Unlock()
-
-		k.mu.Lock()
-		kUsage := k.UsageToday
-		k.mu.Unlock()
-
-		if kUsage < bestUsage {
-			best = k
+		if best.TryReserve(now) {
+			return best, nil
 		}
+		// Lost the race to another goroutine; exclude and pick again.
+		tried[best] = true
 	}
-
-	if best == nil {
-		return nil, fmt.Errorf("all keys are rate limited, exhausted or in cooldown (pool size: %d)", len(kp.keys))
-	}
-
-	return best, nil
 }
 
 func (kp *KeyPool) AllKeys() []*KeyState {

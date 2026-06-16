@@ -7,6 +7,25 @@ import (
 	"openrouter-gateway/internal/store"
 )
 
+func TestStore_GetGeneralStats_Empty(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_stats.db")
+
+	s, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer s.Close()
+
+	stats, err := s.GetGeneralStats()
+	if err != nil {
+		t.Fatalf("GetGeneralStats failed on empty DB: %v", err)
+	}
+	if stats.TotalKeys != 0 || stats.ActiveKeys != 0 || stats.BlockedKeys != 0 {
+		t.Errorf("expected 0 keys, got %+v", stats)
+	}
+}
+
 func TestStore_AddAndDeleteKeys(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")

@@ -1,0 +1,14 @@
+.git
+.github
+build/
+*.exe
+*.exe~
+*.db
+*.db-*
+*.tmp
+~*
+accounts/api_keys.txt
+.env
+.idea/
+.vscode/
+README.md
