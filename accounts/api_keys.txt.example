@@ -1,0 +1,7 @@
+# Пример файла с API ключами OpenRouter. 
+# Поместите ваши реальные ключи в файл accounts/api_keys.txt (по одному ключу на строку).
+# Строки, начинающиеся с #, игнорируются.
+
+sk-or-v1-example-key-1-this-is-just-a-template-dont-use-it
+sk-or-v1-example-key-2-this-is-just-a-template-dont-use-it
+sk-or-v1-example-key-3-this-is-just-a-template-dont-use-it

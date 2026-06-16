@@ -1,0 +1,25 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+gateway
+
+# Databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Private keys (CRITICAL FOR SECURITY)
+accounts/api_keys.txt
+
+# OS/IDEs
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
