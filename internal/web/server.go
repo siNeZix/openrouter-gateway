@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"openrouter-gateway/internal/config"
+	"openrouter-gateway/internal/keys"
 	"openrouter-gateway/internal/models"
 	"openrouter-gateway/internal/store"
 )
@@ -17,6 +18,7 @@ type WebServer struct {
 	cfg        *config.Config
 	store      *store.Store
 	rankingMgr *models.RankingManager
+	pool       *keys.KeyPool
 }
 
 type DashboardData struct {
@@ -29,16 +31,19 @@ type DashboardData struct {
 	Token        string
 }
 
-func NewWebServer(cfg *config.Config, s *store.Store, rm *models.RankingManager) *WebServer {
+func NewWebServer(cfg *config.Config, s *store.Store, rm *models.RankingManager, pool *keys.KeyPool) *WebServer {
 	return &WebServer{
 		cfg:        cfg,
 		store:      s,
 		rankingMgr: rm,
+		pool:       pool,
 	}
 }
 
 func (ws *WebServer) Start(mux *http.ServeMux) {
 	mux.HandleFunc("/", ws.basicAuth(ws.handleDashboard))
+	mux.HandleFunc("/keys/add", ws.basicAuth(ws.handleKeysAdd))
+	mux.HandleFunc("/keys/delete", ws.basicAuth(ws.handleKeysDelete))
 }
 
 func (ws *WebServer) basicAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -149,6 +154,68 @@ func (ws *WebServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (ws *WebServer) handleKeysAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	rawKeysText := r.FormValue("keys")
+	var rawKeys []string
+	lines := strings.Split(rawKeysText, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+		rawKeys = append(rawKeys, line)
+	}
+
+	if len(rawKeys) > 0 {
+		added, err := ws.pool.AddKeys(rawKeys)
+		if err != nil {
+			log.Printf("Failed to add keys: %v", err)
+			http.Error(w, "Failed to add keys to database", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("Added %d new keys via Web GUI", added)
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (ws *WebServer) handleKeysDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	hash := r.FormValue("hash")
+	if hash == "" {
+		http.Error(w, "Missing key hash", http.StatusBadRequest)
+		return
+	}
+
+	if err := ws.pool.RemoveKey(hash); err != nil {
+		log.Printf("Failed to delete key %s: %v", hash, err)
+		http.Error(w, "Failed to delete key from database", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Deleted key hash %s via Web GUI", hash)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // Inlined Tailwind Dashboard Template
 const dashboardTemplate = `
 <!DOCTYPE html>
@@ -156,13 +223,20 @@ const dashboardTemplate = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="10">
     <title>OpenRouter Free Gateway Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
     </style>
+    <script>
+        setInterval(() => {
+            const textarea = document.getElementById('keys-textarea');
+            if (!textarea || (document.activeElement !== textarea && textarea.value.trim() === '')) {
+                window.location.reload();
+            }
+        }, 10000);
+    </script>
 </head>
 <body class="h-full text-slate-100 flex flex-col">
     <!-- Header -->
@@ -315,6 +389,19 @@ const dashboardTemplate = `
             </section>
         </div>
 
+        <!-- Add Keys Section -->
+        <section class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-sm p-5">
+            <h2 class="font-bold text-white flex items-center gap-2 mb-3">
+                <span>➕</span> Добавить новые API ключи
+            </h2>
+            <form action="/keys/add" method="POST" class="space-y-3">
+                <textarea id="keys-textarea" name="keys" rows="3" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-sm font-mono focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-slate-100 placeholder-slate-500" placeholder="Вставьте ключи, каждый с новой строки (пустые строки и комментарии # или // пропускаются)&#10;sk-or-v1-...&#10;sk-or-v1-..."></textarea>
+                <div class="flex justify-end">
+                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white px-5 py-2 rounded-lg font-semibold text-sm transition">Добавить ключи</button>
+                </div>
+            </form>
+        </section>
+
         <!-- Detailed Account Keys Status (Bottom Section) -->
         <section class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-sm flex flex-col">
             <div class="p-4 bg-slate-850 border-b border-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -343,6 +430,7 @@ const dashboardTemplate = `
                             <th class="px-4 py-3 text-center">Процент ошибок</th>
                             <th class="px-4 py-3 text-center">Cooldown</th>
                             <th class="px-4 py-3 text-center">Last Used</th>
+                            <th class="px-4 py-3 text-center">Действие</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-slate-700">
@@ -385,13 +473,19 @@ const dashboardTemplate = `
                             <td class="px-4 py-3 text-center text-xs font-mono text-amber-400">
                                 {{cooldownLeft .CooldownUntil}}
                             </td>
-                            <td class="px-4 py-3 text-center text-xs text-slate-400">
+                             <td class="px-4 py-3 text-center text-xs text-slate-400">
                                 {{formatTime .CooldownUntil}}
-                            </td>
+                             </td>
+                             <td class="px-4 py-3 text-center">
+                                 <form action="/keys/delete" method="POST" onsubmit="return confirm('Вы уверены, что хотите удалить этот ключ?');" class="inline">
+                                     <input type="hidden" name="hash" value="{{.KeyHash}}">
+                                     <button type="submit" class="text-rose-500 hover:text-rose-400 font-bold px-2 py-1 hover:bg-rose-500/10 rounded transition text-xs">🗑️ Удалить</button>
+                                 </form>
+                             </td>
                         </tr>
                         {{else}}
                         <tr>
-                            <td colspan="8" class="px-4 py-8 text-center text-slate-400">Нет загруженных ключей в пуле.</td>
+                            <td colspan="9" class="px-4 py-8 text-center text-slate-400">Нет загруженных ключей в пуле.</td>
                         </tr>
                         {{end}}
                     </tbody>

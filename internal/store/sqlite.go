@@ -27,6 +27,7 @@ type DBKey struct {
 	CooldownUntil     time.Time
 	LastCheckedAt     time.Time
 	LastUsedAt        time.Time
+	RawKey            string
 }
 
 type DBRequest struct {
@@ -100,7 +101,8 @@ func (s *Store) migrate() error {
 			rate_limit_interval TEXT NOT NULL DEFAULT '1m',
 			cooldown_until DATETIME NOT NULL,
 			last_checked_at DATETIME NOT NULL,
-			last_used_at DATETIME NOT NULL
+			last_used_at DATETIME NOT NULL,
+			raw_key TEXT NOT NULL DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS requests (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,67 +131,56 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migration query failed (%s): %w", q, err)
 		}
 	}
+
+	// Migrations: Add raw_key to existing tables if it does not exist
+	_, _ = s.db.Exec(`ALTER TABLE keys ADD COLUMN raw_key TEXT NOT NULL DEFAULT '';`)
+
 	return nil
 }
 
-func (s *Store) SyncKeys(keys []string) error {
+func (s *Store) AddKeys(keys []string) (int, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO keys (key_hash, masked_key, status, cooldown_until, last_checked_at, last_used_at)
-		VALUES (?, ?, 'unchecked', ?, ?, ?)
-		ON CONFLICT(key_hash) DO UPDATE SET masked_key=excluded.masked_key;
+		INSERT INTO keys (key_hash, masked_key, status, cooldown_until, last_checked_at, last_used_at, raw_key)
+		VALUES (?, ?, 'unchecked', ?, ?, ?, ?)
+		ON CONFLICT(key_hash) DO UPDATE SET masked_key=excluded.masked_key, raw_key=excluded.raw_key;
 	`)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer stmt.Close()
 
 	zeroTime := time.Unix(0, 0)
-	hashesMap := make(map[string]bool)
+	added := 0
 
 	for _, k := range keys {
 		h := HashKey(k)
-		hashesMap[h] = true
 		masked := MaskKey(k)
-		_, err := stmt.Exec(h, masked, zeroTime, zeroTime, zeroTime)
+		res, err := stmt.Exec(h, masked, zeroTime, zeroTime, zeroTime, k)
 		if err != nil {
-			return err
+			return 0, err
+		}
+		rows, err := res.RowsAffected()
+		if err == nil && rows > 0 {
+			added++
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return err
+		return 0, err
 	}
 
-	// Optionally clean up keys that are no longer in api_keys.txt
-	rows, err := s.db.Query("SELECT key_hash FROM keys")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
+	return added, nil
+}
 
-	var deleteHashes []string
-	for rows.Next() {
-		var h string
-		if err := rows.Scan(&h); err == nil {
-			if !hashesMap[h] {
-				deleteHashes = append(deleteHashes, h)
-			}
-		}
-	}
-
-	if len(deleteHashes) > 0 {
-		for _, dh := range deleteHashes {
-			s.db.Exec("DELETE FROM keys WHERE key_hash = ?", dh)
-		}
-	}
-
-	return nil
+func (s *Store) DeleteKey(hash string) error {
+	_, err := s.db.Exec("DELETE FROM keys WHERE key_hash = ?", hash)
+	return err
 }
 
 func (s *Store) UpdateKey(k *DBKey) error {
@@ -231,7 +222,7 @@ func (s *Store) GetKeys() ([]*DBKey, error) {
 	rows, err := s.db.Query(`
 		SELECT key_hash, masked_key, status, limit_remaining, usage_today, max_limit, 
 		       is_free_tier, rate_limit_req, rate_limit_interval, cooldown_until, 
-		       last_checked_at, last_used_at 
+		       last_checked_at, last_used_at, raw_key
 		FROM keys
 	`)
 	if err != nil {
@@ -246,7 +237,7 @@ func (s *Store) GetKeys() ([]*DBKey, error) {
 		err := rows.Scan(
 			&k.KeyHash, &k.MaskedKey, &k.Status, &k.LimitRemaining, &k.UsageToday, &k.MaxLimit,
 			&isFree, &k.RateLimitReq, &k.RateLimitInterval, &k.CooldownUntil,
-			&k.LastCheckedAt, &k.LastUsedAt,
+			&k.LastCheckedAt, &k.LastUsedAt, &k.RawKey,
 		)
 		if err != nil {
 			return nil, err

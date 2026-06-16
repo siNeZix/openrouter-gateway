@@ -8,7 +8,6 @@ import (
 
 type Config struct {
 	GatewayToken         string
-	KeysFile             string
 	DbPath               string
 	ListenAddr           string
 	RankingRefresh       time.Duration
@@ -25,7 +24,6 @@ func Load() *Config {
 	cfg := &Config{}
 
 	flag.StringVar(&cfg.GatewayToken, "token", getEnv("GATEWAY_TOKEN", "super-secret-gateway-token"), "Bearer token required to use the gateway")
-	flag.StringVar(&cfg.KeysFile, "keys-file", getEnv("KEYS_FILE", "accounts/api_keys.txt"), "Path to the api keys file")
 	flag.StringVar(&cfg.DbPath, "db-path", getEnv("DB_PATH", "gateway.db"), "Path to the SQLite database")
 	flag.StringVar(&cfg.ListenAddr, "listen", getEnv("LISTEN_ADDR", ":8080"), "Listen address for the gateway server")
 

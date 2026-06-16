@@ -1,12 +1,8 @@
 package keys
 
 import (
-	"bufio"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -14,19 +10,17 @@ import (
 )
 
 type KeyPool struct {
-	store    *store.Store
-	keysFile string
+	store *store.Store
 
 	mu      sync.RWMutex
 	keys    []*KeyState
 	keysMap map[string]*KeyState // hash -> KeyState
 }
 
-func NewKeyPool(s *store.Store, keysFile string) (*KeyPool, error) {
+func NewKeyPool(s *store.Store) (*KeyPool, error) {
 	pool := &KeyPool{
-		store:    s,
-		keysFile: keysFile,
-		keysMap:  make(map[string]*KeyState),
+		store:   s,
+		keysMap: make(map[string]*KeyState),
 	}
 
 	if err := pool.Load(); err != nil {
@@ -40,83 +34,79 @@ func (kp *KeyPool) Load() error {
 	kp.mu.Lock()
 	defer kp.mu.Unlock()
 
-	// 1. Read keys from file
-	absPath, err := filepath.Abs(kp.keysFile)
-	if err != nil {
-		return fmt.Errorf("invalid keys file path: %w", err)
-	}
-
-	file, err := os.Open(absPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// If file doesn't exist, create an empty one
-			dir := filepath.Dir(absPath)
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create directory %s: %w", dir, err)
-			}
-			emptyFile, err := os.Create(absPath)
-			if err != nil {
-				return fmt.Errorf("failed to create empty keys file: %w", err)
-			}
-			emptyFile.Close()
-			log.Printf("Created empty keys file at %s", absPath)
-			return nil
-		}
-		return err
-	}
-	defer file.Close()
-
-	var rawKeys []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
-			continue
-		}
-		rawKeys = append(rawKeys, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading keys file: %w", err)
-	}
-
-	// Remove duplicates
-	rawKeys = uniqueStrings(rawKeys)
-
-	// 2. Sync with SQLite
-	if err := kp.store.SyncKeys(rawKeys); err != nil {
-		return fmt.Errorf("failed to sync keys in database: %w", err)
-	}
-
-	// 3. Load from SQLite
+	// 1. Load from SQLite
 	dbKeys, err := kp.store.GetKeys()
 	if err != nil {
 		return fmt.Errorf("failed to fetch keys from database: %w", err)
 	}
 
-	// Create a fast lookup map of raw keys by their hash
-	rawKeysByHash := make(map[string]string)
-	for _, rk := range rawKeys {
-		rawKeysByHash[store.HashKey(rk)] = rk
-	}
-
-	// 4. Build in-memory states
-	kp.keys = nil
-	kp.keysMap = make(map[string]*KeyState)
+	// 2. Build in-memory states, keeping existing KeyState pointers if possible to preserve cooldowns/counters
+	newKeys := make([]*KeyState, 0, len(dbKeys))
+	newKeysMap := make(map[string]*KeyState)
 
 	for _, dbK := range dbKeys {
-		raw, ok := rawKeysByHash[dbK.KeyHash]
-		if !ok {
-			// This key is in SQLite but not in api_keys.txt. Store.SyncKeys should have deleted it,
-			// but we can skip it to be safe.
+		if dbK.RawKey == "" {
+			// ponytail: skip legacy hash-only keys. Upgrading to web GUI requires deleting/re-adding them.
 			continue
 		}
-		ks := NewKeyState(raw, dbK)
-		kp.keys = append(kp.keys, ks)
-		kp.keysMap[dbK.KeyHash] = ks
+
+		var ks *KeyState
+		if existing, ok := kp.keysMap[dbK.KeyHash]; ok {
+			// Preserve in-memory counters/sliding windows but update DB parameters
+			existing.mu.Lock()
+			existing.Status = dbK.Status
+			existing.LimitRemaining = dbK.LimitRemaining
+			existing.MaxLimit = dbK.MaxLimit
+			existing.IsFreeTier = dbK.IsFreeTier
+			existing.RateLimitReq = dbK.RateLimitReq
+			existing.RateLimitInterval = dbK.RateLimitInterval
+			existing.CooldownUntil = dbK.CooldownUntil
+			existing.LastCheckedAt = dbK.LastCheckedAt
+			existing.LastUsedAt = dbK.LastUsedAt
+			existing.mu.Unlock()
+			ks = existing
+		} else {
+			ks = NewKeyState(dbK.RawKey, dbK)
+		}
+
+		newKeys = append(newKeys, ks)
+		newKeysMap[dbK.KeyHash] = ks
 	}
 
-	log.Printf("Key pool initialized. Total active keys loaded: %d", len(kp.keys))
+	kp.keys = newKeys
+	kp.keysMap = newKeysMap
+
+	log.Printf("Key pool loaded from database. Total active keys: %d", len(kp.keys))
 	return nil
+}
+
+func (kp *KeyPool) AddKeys(rawKeys []string) (int, error) {
+	// Deduplicate raw strings
+	rawKeys = uniqueStrings(rawKeys)
+	if len(rawKeys) == 0 {
+		return 0, nil
+	}
+
+	added, err := kp.store.AddKeys(rawKeys)
+	if err != nil {
+		return 0, err
+	}
+
+	// Reload pool to pick up new keys
+	if err := kp.Load(); err != nil {
+		return added, fmt.Errorf("failed to reload pool after adding keys: %w", err)
+	}
+
+	return added, nil
+}
+
+func (kp *KeyPool) RemoveKey(hash string) error {
+	if err := kp.store.DeleteKey(hash); err != nil {
+		return err
+	}
+
+	// Reload pool to exclude deleted key
+	return kp.Load()
 }
 
 // GetBestKey implements smart selection: least used today, not in cooldown, fits minute limit
