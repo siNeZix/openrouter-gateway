@@ -25,3 +25,4 @@ accounts/api_keys.txt
 *.njsproj
 *.sln
 *.swp
+/agents.local.md
