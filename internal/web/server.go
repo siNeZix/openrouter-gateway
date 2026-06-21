@@ -27,6 +27,7 @@ type DashboardData struct {
 	ModelStats   []store.ModelStats
 	KeyStats     []store.KeyUsageStats
 	TopModels    []store.DBModel
+	FreeModels   []store.DBModel
 	UpdateTime   string
 	RefreshedAt  string
 	Token        string
@@ -98,12 +99,14 @@ func (ws *WebServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	topModels := ws.rankingMgr.GetTopModels()
+	freeModels := ws.rankingMgr.GetFreeModels()
 
 	data := DashboardData{
 		GeneralStats: general,
 		ModelStats:   modelsStats,
 		KeyStats:     keyStats,
 		TopModels:    topModels,
+		FreeModels:   freeModels,
 		RefreshedAt:  time.Now().Format("15:04:05 (02.01.2006)"),
 		Token:        ws.cfg.GatewayToken,
 	}
@@ -429,7 +432,46 @@ const dashboardTemplate = `
         let sortOrder = 'desc';
         let filterStatus = 'all';
         let searchQuery = '';
+        let currentPage = 1;
+        let pageSize = parseInt(localStorage.getItem('gw_page_size') || '50', 10);
         const checkedHashes = new Set();
+        let tokenHidden = true;
+
+        function toggleToken() {
+            const tokenVal = document.getElementById('token-value');
+            const toggleBtn = document.getElementById('toggle-token-btn');
+            const rawToken = tokenVal.getAttribute('data-token');
+            if (tokenHidden) {
+                tokenVal.textContent = rawToken;
+                toggleBtn.innerHTML = '🙈';
+                tokenHidden = false;
+            } else {
+                tokenVal.textContent = '••••••••';
+                toggleBtn.innerHTML = '👁️';
+                tokenHidden = true;
+            }
+        }
+
+        function copyToken() {
+            const tokenVal = document.getElementById('token-value');
+            const rawToken = tokenVal.getAttribute('data-token');
+            navigator.clipboard.writeText(rawToken).then(() => {
+                const copyBtn = document.getElementById('copy-token-btn');
+                const orig = copyBtn.innerHTML;
+                copyBtn.innerHTML = '📋 Скопировано!';
+                setTimeout(() => { copyBtn.innerHTML = orig; }, 1500);
+            }).catch(err => {
+                console.error('Failed to copy token:', err);
+            });
+        }
+
+        function copyToClipboard(text, btn) {
+            navigator.clipboard.writeText(text).then(() => {
+                const orig = btn.innerHTML;
+                btn.innerHTML = '✓';
+                setTimeout(() => { btn.innerHTML = orig; }, 1000);
+            });
+        }
 
         async function updateStats() {
             try {
@@ -494,15 +536,15 @@ const dashboardTemplate = `
 
                 // Update in-memory keys
                 allKeysData = data.keys || [];
-                // Re-render table
-                renderKeysTable();
+                // Re-render table keeping current page, unless reset explicitly requested
+                renderKeysTable(false);
 
             } catch (err) {
                 console.error('Failed to auto update stats:', err);
             }
         }
 
-        function renderKeysTable() {
+        function renderKeysTable(resetPage = false) {
             const keyBody = document.getElementById('key-stats-body');
             if (!keyBody) return;
 
@@ -578,9 +620,25 @@ const dashboardTemplate = `
                 if (!existingHashes.has(h)) checkedHashes.delete(h);
             }
 
-            // 3. HTML Render
-            if (filtered.length > 0) {
-                keyBody.innerHTML = filtered.map(k => {
+            // 3. Pagination Logic
+            const totalItems = filtered.length;
+            const totalPages = Math.ceil(totalItems / pageSize) || 1;
+
+            if (resetPage) {
+                currentPage = 1;
+            } else if (currentPage > totalPages) {
+                currentPage = totalPages;
+            } else if (currentPage < 1) {
+                currentPage = 1;
+            }
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = Math.min(startIndex + pageSize, totalItems);
+            const sliced = filtered.slice(startIndex, endIndex);
+
+            // 4. HTML Render
+            if (sliced.length > 0) {
+                keyBody.innerHTML = sliced.map(k => {
                     let statusBadge = '';
                     if (k.status === 'active') {
                         statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>';
@@ -647,9 +705,74 @@ const dashboardTemplate = `
                 keyBody.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-slate-400">Ключи не найдены по заданным фильтрам.</td></tr>';
             }
 
+            // 5. Update pagination UI
+            renderPaginationControls(totalItems, totalPages, startIndex + 1, endIndex);
+
             updateSortIndicators();
-            updateSelectAllCheckbox();
+            updateSelectAllCheckbox(sliced);
             updateBulkBar();
+        }
+
+        function renderPaginationControls(totalItems, totalPages, fromItem, toItem) {
+            const container = document.getElementById('pagination-container');
+            if (!container) return;
+
+            if (totalItems === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            const isFirst = currentPage === 1;
+            const isLast = currentPage === totalPages;
+
+            let html = '<div class="flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-400">' +
+                '<div>' +
+                    'Показано <span class="font-semibold text-white">' + fromItem + '–' + toItem + '</span> из <span class="font-semibold text-white">' + totalItems + '</span> ключей' +
+                '</div>' +
+                '<div class="flex items-center gap-2">' +
+                    '<!-- Page Size Selector -->' +
+                    '<span class="text-slate-500">Строк:</span>' +
+                    '<select onchange="changePageSize(this.value)" class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-indigo-500">' +
+                        '<option value="25" ' + (pageSize === 25 ? 'selected' : '') + '>25</option>' +
+                        '<option value="50" ' + (pageSize === 50 ? 'selected' : '') + '>50</option>' +
+                        '<option value="100" ' + (pageSize === 100 ? 'selected' : '') + '>100</option>' +
+                        '<option value="250" ' + (pageSize === 250 ? 'selected' : '') + '>250</option>' +
+                        '<option value="500" ' + (pageSize === 500 ? 'selected' : '') + '>500</option>' +
+                        '<option value="10000" ' + (pageSize >= 10000 ? 'selected' : '') + '>Все</option>' +
+                    '</select>' +
+
+                    '<!-- Page Navigation Buttons -->' +
+                    '<div class="inline-flex rounded-md shadow-sm ml-2">' +
+                        '<button onclick="goToPage(1)" ' + (isFirst ? 'disabled' : '') + ' class="px-2.5 py-1.5 rounded-l-md border border-slate-700 bg-slate-900 text-slate-400 hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-slate-900 transition">' +
+                            '≪' +
+                        '</button>' +
+                        '<button onclick="goToPage(' + (currentPage - 1) + ')" ' + (isFirst ? 'disabled' : '') + ' class="px-2.5 py-1.5 border-t border-b border-r border-slate-700 bg-slate-900 text-slate-400 hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-slate-900 transition">' +
+                            '‹ Назад' +
+                        '</button>' +
+                        '<span class="px-3 py-1.5 border-t border-b border-r border-slate-700 bg-slate-800 text-white font-medium select-none">' +
+                            currentPage + ' / ' + totalPages + '</span>' +
+                        '<button onclick="goToPage(' + (currentPage + 1) + ')" ' + (isLast ? 'disabled' : '') + ' class="px-2.5 py-1.5 border-t border-b border-r border-slate-700 bg-slate-900 text-slate-400 hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-slate-900 transition">' +
+                            'Вперед ›' +
+                        '</button>' +
+                        '<button onclick="goToPage(' + totalPages + ')" ' + (isLast ? 'disabled' : '') + ' class="px-2.5 py-1.5 rounded-r-md border-t border-b border-r border-slate-700 bg-slate-900 text-slate-400 hover:bg-slate-800 disabled:opacity-40 disabled:hover:bg-slate-900 transition">' +
+                            '≫' +
+                        '</button>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+            container.innerHTML = html;
+        }
+
+        function goToPage(page) {
+            currentPage = page;
+            renderKeysTable(false);
+        }
+
+        function changePageSize(size) {
+            pageSize = parseInt(size, 10);
+            localStorage.setItem('gw_page_size', pageSize);
+            currentPage = 1;
+            renderKeysTable(false);
         }
 
         // Selection Handlers
@@ -659,12 +782,20 @@ const dashboardTemplate = `
             } else {
                 checkedHashes.delete(hash);
             }
-            updateSelectAllCheckbox();
+            // Update select-all master checkbox based on current sliced rendered keys
+            const slicedInputs = document.querySelectorAll('.key-checkbox');
+            let allChecked = slicedInputs.length > 0;
+            slicedInputs.forEach(cb => {
+                if (!cb.checked) allChecked = false;
+            });
+            const master = document.getElementById('select-all-keys');
+            if (master) master.checked = allChecked;
+
             updateBulkBar();
         }
 
         function toggleSelectAll(masterCheckbox) {
-            // Get currently rendered / filtered keys to select only those
+            // Select only currently visible/sliced checkboxes
             const visibleCheckboxes = document.querySelectorAll('.key-checkbox');
             visibleCheckboxes.forEach(cb => {
                 const hash = cb.getAttribute('data-hash');
@@ -678,17 +809,16 @@ const dashboardTemplate = `
             updateBulkBar();
         }
 
-        function updateSelectAllCheckbox() {
+        function updateSelectAllCheckbox(sliced) {
             const master = document.getElementById('select-all-keys');
             if (!master) return;
-            const visibleCheckboxes = document.querySelectorAll('.key-checkbox');
-            if (visibleCheckboxes.length === 0) {
+            if (sliced.length === 0) {
                 master.checked = false;
                 return;
             }
             let allChecked = true;
-            visibleCheckboxes.forEach(cb => {
-                if (!cb.checked) allChecked = false;
+            sliced.forEach(k => {
+                if (!checkedHashes.has(k.key_hash)) allChecked = false;
             });
             master.checked = allChecked;
         }
@@ -715,7 +845,23 @@ const dashboardTemplate = `
                 sortCol = col;
                 sortOrder = 'desc'; // default to desc
             }
-            renderKeysTable();
+            currentPage = 1; // reset to page 1 on sort change
+            renderKeysTable(false);
+        }
+
+        function updateSortIndicators() {
+            const columns = ['key', 'status', 'usage', 'limit', 'requests', 'errors', 'cooldown', 'last_used'];
+            columns.forEach(col => {
+                const indicator = document.getElementById('sort-indicator-' + col);
+                if (indicator) {
+                    if (sortCol === col) {
+                        indicator.textContent = sortOrder === 'asc' ? ' ▲' : ' ▼';
+                        indicator.className = "text-indigo-400 font-bold";
+                    } else {
+                        indicator.textContent = '';
+                    }
+                }
+            });
         }
 
         function setFilterStatus(status) {
@@ -732,12 +878,35 @@ const dashboardTemplate = `
                     }
                 }
             });
-            renderKeysTable();
+            currentPage = 1; // reset to page 1 on filter change
+            renderKeysTable(false);
         }
 
         function handleSearch(val) {
             searchQuery = val;
-            renderKeysTable();
+            currentPage = 1; // reset to page 1 on search change
+            renderKeysTable(false);
+        }
+
+        // Search free models client-side
+        function filterFreeModels(val) {
+            const q = val.toLowerCase().trim();
+            const rows = document.querySelectorAll('.free-model-row');
+            let matchedCount = 0;
+            rows.forEach(row => {
+                const name = row.getAttribute('data-name').toLowerCase();
+                const id = row.getAttribute('data-id').toLowerCase();
+                if (name.includes(q) || id.includes(q)) {
+                    row.classList.remove('hidden');
+                    matchedCount++;
+                } else {
+                    row.classList.add('hidden');
+                }
+            });
+            const counter = document.getElementById('free-models-matched-count');
+            if (counter) {
+                counter.textContent = matchedCount;
+            }
         }
 
         // Actions
@@ -781,7 +950,7 @@ const dashboardTemplate = `
 
         // Run on initial load
         window.addEventListener('DOMContentLoaded', () => {
-            renderKeysTable();
+            renderKeysTable(true);
             setInterval(updateStats, 5000);
         });
     </script>
@@ -798,9 +967,11 @@ const dashboardTemplate = `
                 </div>
             </div>
             <div class="flex flex-wrap items-center gap-4 text-sm">
-                <div class="bg-slate-900 px-3 py-1.5 rounded-md border border-slate-700 text-xs">
+                <div class="bg-slate-900 px-3 py-1.5 rounded-md border border-slate-700 text-xs flex items-center gap-2">
                     <span class="text-slate-400">Gateway Token:</span>
-                    <code class="text-emerald-400 font-mono ml-1">{{.Token}}</code>
+                    <code id="token-value" data-token="{{.Token}}" class="text-emerald-400 font-mono">••••••••</code>
+                    <button id="toggle-token-btn" onclick="toggleToken()" class="text-slate-400 hover:text-white transition px-1 py-0.5 rounded hover:bg-slate-800" title="Показать/скрыть токен">👁️</button>
+                    <button id="copy-token-btn" onclick="copyToken()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold px-2 py-1 rounded transition" title="Скопировать токен">📋 Copy</button>
                 </div>
                 <div class="bg-slate-900 px-3 py-1.5 rounded-md border border-slate-700 text-xs text-slate-400">
                     Обновлено: <strong id="refreshed-at" class="text-white">{{.RefreshedAt}}</strong> (авто-обновление 5с)
@@ -860,7 +1031,7 @@ const dashboardTemplate = `
 
         <!-- Two Columns Layout: Models Top & Usage Stats -->
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <!-- Left Column: Shir-Man Top Free Models (4 cols) -->
+            <!-- Left Column: Shir-Man Top Free Models (5 cols) -->
             <section class="lg:col-span-5 bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col shadow-sm">
                 <div class="p-4 bg-slate-850 border-b border-slate-700 flex justify-between items-center">
                     <h2 class="font-bold text-white flex items-center gap-2">
@@ -868,7 +1039,7 @@ const dashboardTemplate = `
                     </h2>
                     <span class="text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-2 py-0.5 rounded">Free Only</span>
                 </div>
-                <div class="p-4 flex-1 space-y-3 overflow-y-auto max-h-[450px]">
+                <div class="p-4 flex-1 space-y-3 overflow-y-auto max-h-[400px]">
                     {{range $index, $m := .TopModels}}
                     <div class="bg-slate-900 border border-slate-700 rounded-lg p-3 flex items-center justify-between gap-2 hover:border-slate-600 transition">
                         <div class="flex items-center gap-3">
@@ -905,7 +1076,7 @@ const dashboardTemplate = `
                         <span>📊</span> Статистика использования моделей
                     </h2>
                 </div>
-                <div class="overflow-x-auto flex-1 max-h-[450px]">
+                <div class="overflow-x-auto flex-1 max-h-[400px]">
                     <table class="w-full text-sm text-left border-collapse">
                         <thead class="bg-slate-900 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-700">
                             <tr>
@@ -937,6 +1108,65 @@ const dashboardTemplate = `
             </section>
         </div>
 
+        <!-- NEW SECTION: Detailed List of ALL Free Models (Collapsible Accordion) -->
+        <section class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-sm">
+            <details class="group">
+                <summary class="p-4 bg-slate-850 hover:bg-slate-750 cursor-pointer flex justify-between items-center select-none transition">
+                    <h2 class="font-bold text-white flex items-center gap-2.5">
+                        <span>🤖</span> Список всех бесплатных моделей OpenRouter
+                        <span class="text-xs bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-2 py-0.5 rounded-full font-semibold">
+                            <span id="free-models-matched-count">{{len .FreeModels}}</span> из {{len .FreeModels}}
+                        </span>
+                    </h2>
+                    <span class="text-slate-400 group-open:rotate-180 transition-transform duration-200">▼</span>
+                </summary>
+                <div class="p-4 border-t border-slate-700 space-y-4">
+                    <!-- Filter bar inside accordion -->
+                    <div class="relative max-w-md">
+                        <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-500">🔍</span>
+                        <input type="text" oninput="filterFreeModels(this.value)" placeholder="Поиск по названию или ID модели..." class="w-full pl-9 bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-slate-100 placeholder-slate-500">
+                    </div>
+
+                    <!-- Scrollable table of free models -->
+                    <div class="overflow-x-auto max-h-[350px] overflow-y-auto border border-slate-700 rounded-lg">
+                        <table class="w-full text-sm text-left border-collapse">
+                            <thead class="bg-slate-900 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-700 sticky top-0 z-10">
+                                <tr>
+                                    <th class="px-4 py-2.5">Название модели</th>
+                                    <th class="px-4 py-2.5">OpenRouter ID</th>
+                                    <th class="px-4 py-2.5 text-center">Контекст</th>
+                                    <th class="px-4 py-2.5 text-center w-28">Ссылка</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-700">
+                                {{range .FreeModels}}
+                                <tr class="free-model-row hover:bg-slate-750/50 transition" data-name="{{.Name}}" data-id="{{.ID}}">
+                                    <td class="px-4 py-2.5 font-semibold text-white">{{.Name}}</td>
+                                    <td class="px-4 py-2.5 font-mono text-xs text-slate-300">
+                                        <div class="flex items-center gap-1.5">
+                                            <span>{{.ID}}</span>
+                                            <button onclick="copyToClipboard('{{.ID}}', this)" class="bg-slate-800 hover:bg-slate-700 hover:text-white text-[10px] text-slate-400 px-1.5 py-0.5 rounded transition" title="Копировать ID">📋</button>
+                                        </div>
+                                    </td>
+                                    <td class="px-4 py-2.5 text-center font-mono font-medium text-slate-300">{{divInt .ContextLength 1024}}K</td>
+                                    <td class="px-4 py-2.5 text-center">
+                                        <a href="https://openrouter.ai/models/{{.ID}}" target="_blank" rel="noopener" class="inline-flex items-center text-xs text-indigo-400 hover:text-indigo-300 hover:underline">
+                                            OpenRouter ↗
+                                        </a>
+                                    </td>
+                                </tr>
+                                {{else}}
+                                <tr>
+                                    <td colspan="4" class="px-4 py-6 text-center text-slate-400">Список бесплатных моделей пуст.</td>
+                                </tr>
+                                {{end}}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </details>
+        </section>
+
         <!-- Add Keys Section -->
         <section class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-sm p-5">
             <h2 class="font-bold text-white flex items-center gap-2 mb-3">
@@ -957,7 +1187,7 @@ const dashboardTemplate = `
                     <h2 class="font-bold text-white flex items-center gap-2">
                         <span>🔑</span> Детализация API ключей (Аккаунтов)
                     </h2>
-                    <p class="text-xs text-slate-400">Наглядный мониторинг лимитов и ротации по 1000+ ключам</p>
+                    <p class="text-xs text-slate-400">Наглядный мониторинг лимитов и ротации по 1000+ ключам (удобная пагинация)</p>
                 </div>
                 <div class="flex flex-wrap items-center gap-2 text-xs">
                     <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Active</span>
@@ -1021,6 +1251,11 @@ const dashboardTemplate = `
                         <!-- Will be populated dynamically via renderKeysTable() on load and update -->
                     </tbody>
                 </table>
+            </div>
+
+            <!-- Pagination bar container -->
+            <div id="pagination-container" class="p-4 bg-slate-850 border-t border-slate-700">
+                <!-- Built dynamically inside JS -->
             </div>
         </section>
     </main>
