@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # CGO disabled: modernc.org/sqlite is pure Go, so we get a static binary.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway cmd/gateway/main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
 
 # ponytail: alpine not scratch - need ca-certificates for HTTPS to openrouter.ai
 FROM alpine:3.20
