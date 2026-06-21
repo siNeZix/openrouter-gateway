@@ -242,9 +242,22 @@ func (ph *ProxyHandler) handleChatCompletions(w http.ResponseWriter, r *http.Req
 		ParseRateLimits(keyState, resp.Header)
 
 		if resp.StatusCode >= 400 {
-			// Read body to inspect if it's a credit/quota issue
+			// Read body to inspect if it's a credit/quota issue or upstream rate limit
 			respBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+
+			if resp.StatusCode == http.StatusTooManyRequests && IsUpstreamRateLimit(respBody) {
+				log.Printf("Detected upstream rate-limit for model %s (provider: %s). Fast-failing without putting key %s on cooldown.", resolvedModel, "upstream", keyState.MaskedKey)
+				// Set headers and forward the upstream 429 directly to client
+				for k, v := range resp.Header {
+					if k != "Content-Length" && k != "Content-Encoding" {
+						w.Header()[k] = v
+					}
+				}
+				w.WriteHeader(http.StatusTooManyRequests)
+				w.Write(respBody)
+				return
+			}
 
 			cooldown := HandleProxyError(keyState, resp)
 

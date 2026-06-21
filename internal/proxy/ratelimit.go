@@ -82,9 +82,32 @@ func HandleProxyError(ks *keys.KeyState, resp *http.Response) time.Duration {
 // OpenRouterErrorResponse is the structure returned by OpenRouter on error
 type OpenRouterErrorResponse struct {
 	Error struct {
-		Message string `json:"message"`
-		Code    int    `json:"code"`
+		Message  string `json:"message"`
+		Code     int    `json:"code"`
+		Metadata struct {
+			Raw          string `json:"raw"`
+			ProviderName string `json:"provider_name"`
+			IsByok       bool   `json:"is_byok"`
+		} `json:"metadata"`
 	} `json:"error"`
+}
+
+// IsUpstreamRateLimit checks if 429 error is from upstream provider, not individual key
+// ponytail: heuristic-based check on metadata/raw string. Update if OpenRouter error structure changes.
+func IsUpstreamRateLimit(body []byte) bool {
+	var errResp OpenRouterErrorResponse
+	if err := json.Unmarshal(body, &errResp); err == nil {
+		if errResp.Error.Code == 429 {
+			raw := strings.ToLower(errResp.Error.Metadata.Raw)
+			if strings.Contains(raw, "rate-limited upstream") || strings.Contains(raw, "upstream rate-limited") {
+				return true
+			}
+			if errResp.Error.Metadata.ProviderName != "" && !errResp.Error.Metadata.IsByok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func IsQuotaExhaustedError(body []byte) bool {
