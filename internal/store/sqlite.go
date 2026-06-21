@@ -184,6 +184,54 @@ func (s *Store) DeleteKey(hash string) error {
 	return err
 }
 
+func (s *Store) DeleteKeys(hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("DELETE FROM keys WHERE key_hash = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, hash := range hashes {
+		if _, err := stmt.Exec(hash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) UpdateKeysStatus(hashes []string, status string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare("UPDATE keys SET status = ? WHERE key_hash = ?")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, hash := range hashes {
+		if _, err := stmt.Exec(status, hash); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) UpdateKey(k *DBKey) error {
 	_, err := s.db.Exec(`
 		UPDATE keys SET

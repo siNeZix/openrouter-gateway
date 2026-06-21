@@ -96,3 +96,59 @@ func TestStore_AddAndDeleteKeys(t *testing.T) {
 		t.Errorf("expected remaining key to be sk-or-v1-def456uvw, got %s", dbKeysAfter[0].RawKey)
 	}
 }
+
+func TestStore_BulkOperations(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_bulk.db")
+
+	s, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer s.Close()
+
+	keys := []string{"key1", "key2", "key3"}
+	_, err = s.AddKeys(keys)
+	if err != nil {
+		t.Fatalf("failed to add keys: %v", err)
+	}
+
+	h1 := store.HashKey("key1")
+	h2 := store.HashKey("key2")
+	h3 := store.HashKey("key3")
+
+	// Test bulk status update to disabled
+	err = s.UpdateKeysStatus([]string{h1, h2}, "disabled")
+	if err != nil {
+		t.Fatalf("failed to update keys status: %v", err)
+	}
+
+	dbKeys, err := s.GetKeys()
+	if err != nil {
+		t.Fatalf("failed to get keys: %v", err)
+	}
+
+	disabledCount := 0
+	for _, k := range dbKeys {
+		if k.Status == "disabled" {
+			disabledCount++
+		}
+	}
+	if disabledCount != 2 {
+		t.Errorf("expected 2 disabled keys, got %d", disabledCount)
+	}
+
+	// Test bulk delete
+	err = s.DeleteKeys([]string{h1, h2, h3})
+	if err != nil {
+		t.Fatalf("failed to delete keys: %v", err)
+	}
+
+	dbKeysAfter, err := s.GetKeys()
+	if err != nil {
+		t.Fatalf("failed to get keys after deletion: %v", err)
+	}
+	if len(dbKeysAfter) != 0 {
+		t.Errorf("expected 0 keys after bulk deletion, got %d", len(dbKeysAfter))
+	}
+}

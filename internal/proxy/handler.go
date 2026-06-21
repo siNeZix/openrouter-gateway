@@ -89,20 +89,67 @@ func (ph *ProxyHandler) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	var data []ModelItem
 
-	// Add aliases
-	data = append(data, ModelItem{ID: "top1", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
-	data = append(data, ModelItem{ID: "top2", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
-	data = append(data, ModelItem{ID: "top3", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
-	data = append(data, ModelItem{ID: "openrouter/free", Object: "model", Created: time.Now().Unix(), OwnedBy: "openrouter"})
-
-	// Add other real models
+	// Add aliases top1, top2, top3 with real model metadata if resolved
+	modelMap := make(map[string]store.DBModel)
 	for _, m := range topModels {
-		data = append(data, ModelItem{
-			ID:      m.ID,
-			Object:  "model",
-			Created: m.UpdatedAt.Unix(),
-			OwnedBy: "openrouter",
-		})
+		modelMap[m.ID] = m
+	}
+
+	if resolved, ok := ph.rankingMgr.ResolveAlias("top1"); ok {
+		if orig, exists := modelMap[resolved]; exists {
+			data = append(data, ModelItem{
+				ID:      "top1",
+				Object:  "model",
+				Created: orig.UpdatedAt.Unix(),
+				OwnedBy: strings.Split(orig.ID, "/")[0],
+			})
+		} else {
+			data = append(data, ModelItem{ID: "top1", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
+		}
+	} else {
+		data = append(data, ModelItem{ID: "top1", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
+	}
+
+	if resolved, ok := ph.rankingMgr.ResolveAlias("top2"); ok {
+		if orig, exists := modelMap[resolved]; exists {
+			data = append(data, ModelItem{
+				ID:      "top2",
+				Object:  "model",
+				Created: orig.UpdatedAt.Unix(),
+				OwnedBy: strings.Split(orig.ID, "/")[0],
+			})
+		} else {
+			data = append(data, ModelItem{ID: "top2", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
+		}
+	} else {
+		data = append(data, ModelItem{ID: "top2", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
+	}
+
+	if resolved, ok := ph.rankingMgr.ResolveAlias("top3"); ok {
+		if orig, exists := modelMap[resolved]; exists {
+			data = append(data, ModelItem{
+				ID:      "top3",
+				Object:  "model",
+				Created: orig.UpdatedAt.Unix(),
+				OwnedBy: strings.Split(orig.ID, "/")[0],
+			})
+		} else {
+			data = append(data, ModelItem{ID: "top3", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
+		}
+	} else {
+		data = append(data, ModelItem{ID: "top3", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
+	}
+
+	// Add only real models containing ":free" in their ID
+	for _, m := range topModels {
+		if strings.Contains(m.ID, ":free") {
+			data = append(data, ModelItem{
+				ID:      m.ID,
+				Object:  "model",
+				Created: m.UpdatedAt.Unix(),
+				OwnedBy: strings.Split(m.ID, "/")[0],
+			})
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -101,7 +101,7 @@ func (ks *KeyState) cleanOldRequests(now time.Time) {
 func (ks *KeyState) usable(now time.Time) bool {
 	ks.ResetDailyUsageIfNewDay()
 
-	if ks.Status == "invalid" || ks.Status == "day_exhausted" {
+	if ks.Status == "invalid" || ks.Status == "day_exhausted" || ks.Status == "disabled" {
 		return false
 	}
 	if ks.CooldownUntil.After(now) {

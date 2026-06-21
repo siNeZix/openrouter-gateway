@@ -118,6 +118,10 @@ func (kc *KeyChecker) findKeyToVerify() *KeyState {
 		lastChecked := ks.LastCheckedAt
 		ks.mu.Unlock()
 
+		if status == "disabled" {
+			continue
+		}
+
 		if status == "unchecked" || lastChecked.IsZero() {
 			bestCandidate = ks
 			bestPriority = 3

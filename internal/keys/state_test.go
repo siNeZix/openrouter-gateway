@@ -81,3 +81,16 @@ func TestResetDailyUsageIfNewDay(t *testing.T) {
 		t.Fatalf("status not reactivated: %s", ks.Status)
 	}
 }
+
+func TestDisabledKeyNotUsable(t *testing.T) {
+	ks := newState(20)
+	ks.Status = "disabled"
+	now := time.Now()
+
+	if ks.CanUse(now) {
+		t.Fatal("disabled key should not be usable")
+	}
+	if ks.TryReserve(now) {
+		t.Fatal("should not be able to reserve a disabled key")
+	}
+}

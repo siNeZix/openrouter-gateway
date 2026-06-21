@@ -109,6 +109,20 @@ func (kp *KeyPool) RemoveKey(hash string) error {
 	return kp.Load()
 }
 
+func (kp *KeyPool) RemoveKeys(hashes []string) error {
+	if err := kp.store.DeleteKeys(hashes); err != nil {
+		return err
+	}
+	return kp.Load()
+}
+
+func (kp *KeyPool) UpdateKeysStatus(hashes []string, status string) error {
+	if err := kp.store.UpdateKeysStatus(hashes, status); err != nil {
+		return err
+	}
+	return kp.Load()
+}
+
 // GetBestKey selects the usable key with the least usage today and atomically
 // reserves it (registers the request) before returning, so two concurrent
 // callers can never hand out the same slot and overrun the per-key minute limit.

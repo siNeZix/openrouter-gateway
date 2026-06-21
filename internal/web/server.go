@@ -46,6 +46,7 @@ func (ws *WebServer) Start(mux *http.ServeMux) {
 	mux.HandleFunc("/api/stats", ws.basicAuth(ws.handleAPIStats))
 	mux.HandleFunc("/keys/add", ws.basicAuth(ws.handleKeysAdd))
 	mux.HandleFunc("/keys/delete", ws.basicAuth(ws.handleKeysDelete))
+	mux.HandleFunc("/keys/bulk", ws.basicAuth(ws.handleKeysBulk))
 }
 
 func (ws *WebServer) basicAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -185,15 +186,15 @@ func (ws *WebServer) handleAPIStats(w http.ResponseWriter, r *http.Request) {
 
 	// Format cooldown durations for JSON response
 	type CustomKeyStats struct {
-		MaskedKey     string    `json:"masked_key"`
-		KeyHash       string    `json:"key_hash"`
-		Status        string    `json:"status"`
-		TodayUsage    int64     `json:"today_usage"`
-		Limit         int64     `json:"limit"`
-		TotalRequests int64     `json:"total_requests"`
-		ErrorRequests int64     `json:"error_requests"`
-		CooldownLeft  string    `json:"cooldown_left"`
-		FormattedLast string    `json:"formatted_last"`
+		MaskedKey     string `json:"masked_key"`
+		KeyHash       string `json:"key_hash"`
+		Status        string `json:"status"`
+		TodayUsage    int64  `json:"today_usage"`
+		Limit         int64  `json:"limit"`
+		TotalRequests int64  `json:"total_requests"`
+		ErrorRequests int64  `json:"error_requests"`
+		CooldownLeft  string `json:"cooldown_left"`
+		FormattedLast string `json:"formatted_last"`
 	}
 
 	customKeys := make([]CustomKeyStats, len(keyStats))
@@ -330,6 +331,69 @@ func (ws *WebServer) handleKeysDelete(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+func (ws *WebServer) handleKeysBulk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// We can receive multiple form parameters, or a single comma-separated string
+	rawHashes := r.Form["hashes"]
+	if len(rawHashes) == 1 && strings.Contains(rawHashes[0], ",") {
+		rawHashes = strings.Split(rawHashes[0], ",")
+	}
+
+	var hashes []string
+	for _, h := range rawHashes {
+		h = strings.TrimSpace(h)
+		if h != "" {
+			hashes = append(hashes, h)
+		}
+	}
+
+	action := r.FormValue("action")
+	if len(hashes) == 0 || action == "" {
+		http.Error(w, "Missing hashes or action", http.StatusBadRequest)
+		return
+	}
+
+	var err error
+	switch action {
+	case "delete":
+		err = ws.pool.RemoveKeys(hashes)
+		log.Printf("Bulk deleted %d keys via Web GUI", len(hashes))
+	case "enable":
+		err = ws.pool.UpdateKeysStatus(hashes, "unchecked")
+		log.Printf("Bulk enabled %d keys via Web GUI", len(hashes))
+	case "disable":
+		err = ws.pool.UpdateKeysStatus(hashes, "disabled")
+		log.Printf("Bulk disabled %d keys via Web GUI", len(hashes))
+	default:
+		http.Error(w, "Unknown action", http.StatusBadRequest)
+		return
+	}
+
+	if err != nil {
+		log.Printf("Failed bulk operation (%s) on keys: %v", action, err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Support both AJAX/fetch and standard form submission redirects
+	if r.Header.Get("X-Requested-With") == "XMLHttpRequest" || strings.Contains(r.Header.Get("Accept"), "application/json") {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+		return
+	}
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // Inlined Tailwind Dashboard Template
 const dashboardTemplate = `
 <!DOCTYPE html>
@@ -344,6 +408,29 @@ const dashboardTemplate = `
         body { font-family: 'Inter', sans-serif; }
     </style>
     <script>
+        // Global State
+        let allKeysData = [
+            {{range .KeyStats}}
+            {
+                masked_key: "{{.MaskedKey}}",
+                key_hash: "{{.KeyHash}}",
+                status: "{{.Status}}",
+                today_usage: {{.TodayUsage}},
+                limit: {{.Limit}},
+                total_requests: {{.TotalRequests}},
+                error_requests: {{.ErrorRequests}},
+                cooldown_left: "{{cooldownLeft .CooldownUntil}}",
+                formatted_last: "{{formatTime .CooldownUntil}}"
+            },
+            {{end}}
+        ];
+
+        let sortCol = 'usage';
+        let sortOrder = 'desc';
+        let filterStatus = 'all';
+        let searchQuery = '';
+        const checkedHashes = new Set();
+
         async function updateStats() {
             try {
                 const textarea = document.getElementById('keys-textarea');
@@ -405,75 +492,298 @@ const dashboardTemplate = `
                     }
                 }
 
-                // Update keys usage table
-                const keyBody = document.getElementById('key-stats-body');
-                if (keyBody) {
-                    if (data.keys && data.keys.length > 0) {
-                        keyBody.innerHTML = data.keys.map(k => {
-                            let statusBadge = '';
-                            if (k.status === 'active') {
-                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>';
-                            } else if (k.status === 'rate_limited') {
-                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">COOLDOWN</span>';
-                            } else if (k.status === 'day_exhausted') {
-                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">EXHAUSTED</span>';
-                            } else if (k.status === 'invalid') {
-                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-slate-700/30 text-slate-500 border border-slate-700/50">INVALID</span>';
-                            } else {
-                                statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20">UNCHECKED</span>';
-                            }
+                // Update in-memory keys
+                allKeysData = data.keys || [];
+                // Re-render table
+                renderKeysTable();
 
-                            const limitText = k.limit <= 0 ? "<span class=\"text-slate-500\">unknown</span>" : 
-                                ("<span class=\"" + (k.limit <= 10 ? "text-rose-400 font-semibold" : "text-slate-300") + "\">" + k.limit + "</span>");
-
-                            const errPercent = k.total_requests > 0 ? (k.error_requests / k.total_requests * 100) : 0;
-                            const errText = k.total_requests > 0 ? 
-                                ("<span class=\"font-mono " + (errPercent > 10.0 ? "text-rose-400 font-semibold" : "text-slate-400") + "\">" + errPercent.toFixed(1) + "%</span>") : 
-                                "<span class=\"text-slate-500\">-</span>";
-
-                            return "" +
-                                "<tr class=\"hover:bg-slate-750 transition\">" +
-                                    "<td class=\"px-4 py-3 font-mono text-xs text-slate-300 font-medium\">" +
-                                        "<span title=\"" + k.key_hash + "\">" + k.masked_key + "</span>" +
-                                    "</td>" +
-                                    "<td class=\"px-4 py-3 text-xs\">" +
-                                        statusBadge +
-                                    "</td>" +
-                                    "<td class=\"px-4 py-3 text-center font-mono font-medium text-white\">" + k.today_usage + "</td>" +
-                                    "<td class=\"px-4 py-3 text-center font-mono\">" +
-                                        limitText +
-                                    "</td>" +
-                                    "<td class=\"px-4 py-3 text-center font-mono text-slate-400\">" + k.total_requests + "</td>" +
-                                    "<td class=\"px-4 py-3 text-center text-xs\">" +
-                                        errText +
-                                    "</td>" +
-                                    "<td class=\"px-4 py-3 text-center text-xs font-mono text-amber-400\">" +
-                                        k.cooldown_left +
-                                    "</td>" +
-                                     "<td class=\"px-4 py-3 text-center text-xs text-slate-400\">" +
-                                        k.formatted_last +
-                                     "</td>" +
-                                     "<td class=\"px-4 py-3 text-center\">" +
-                                         "<form action=\"/keys/delete\" method=\"POST\" onsubmit=\"return confirm('Вы уверены, что хотите удалить этот ключ?');\" class=\"inline\">" +
-                                             "<input type=\"hidden\" name=\"hash\" value=\"" + k.key_hash + "\">" +
-                                             "<button type=\"submit\" class=\"text-rose-500 hover:text-rose-400 font-bold px-2 py-1 hover:bg-rose-500/10 rounded transition text-xs\">🗑️ Удалить</button>" +
-                                         "</form>" +
-                                     "</td>" +
-                                "</tr>";
-                        }).join('');
-                    } else {
-                        keyBody.innerHTML = "" +
-                            "<tr>" +
-                                "<td colspan=\"9\" class=\"px-4 py-8 text-center text-slate-400\">Нет загруженных ключей в пуле.</td>" +
-                            "</tr>";
-                    }
-                }
             } catch (err) {
                 console.error('Failed to auto update stats:', err);
             }
         }
 
-        setInterval(updateStats, 5000);
+        function renderKeysTable() {
+            const keyBody = document.getElementById('key-stats-body');
+            if (!keyBody) return;
+
+            // 1. Filter
+            let filtered = allKeysData.filter(k => {
+                // Search query
+                if (searchQuery) {
+                    const q = searchQuery.toLowerCase();
+                    if (!k.masked_key.toLowerCase().includes(q) && !k.key_hash.toLowerCase().includes(q)) {
+                        return false;
+                    }
+                }
+                // Status
+                if (filterStatus === 'all') return true;
+                if (filterStatus === 'active') return k.status === 'active';
+                if (filterStatus === 'cooldown') return k.status === 'rate_limited';
+                if (filterStatus === 'exhausted') return k.status === 'day_exhausted';
+                if (filterStatus === 'invalid') return k.status === 'invalid';
+                if (filterStatus === 'unchecked') return k.status === 'unchecked';
+                if (filterStatus === 'disabled') return k.status === 'disabled';
+                return true;
+            });
+
+            // 2. Sort
+            filtered.sort((a, b) => {
+                let valA, valB;
+                switch(sortCol) {
+                    case 'key':
+                        valA = a.masked_key;
+                        valB = b.masked_key;
+                        break;
+                    case 'status':
+                        valA = a.status;
+                        valB = b.status;
+                        break;
+                    case 'usage':
+                        valA = Number(a.today_usage);
+                        valB = Number(b.today_usage);
+                        break;
+                    case 'limit':
+                        valA = Number(a.limit);
+                        valB = Number(b.limit);
+                        break;
+                    case 'requests':
+                        valA = Number(a.total_requests);
+                        valB = Number(b.total_requests);
+                        break;
+                    case 'errors':
+                        valA = a.total_requests > 0 ? (a.error_requests / a.total_requests) : -1;
+                        valB = b.total_requests > 0 ? (b.error_requests / b.total_requests) : -1;
+                        break;
+                    case 'cooldown':
+                        valA = a.cooldown_left || '';
+                        valB = b.cooldown_left || '';
+                        break;
+                    case 'last_used':
+                        valA = a.formatted_last || '';
+                        valB = b.formatted_last || '';
+                        break;
+                    default:
+                        valA = Number(a.today_usage);
+                        valB = Number(b.today_usage);
+                }
+
+                if (valA < valB) return sortOrder === 'asc' ? -1 : 1;
+                if (valA > valB) return sortOrder === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            // Clean up any stale checked hashes that no longer exist
+            const existingHashes = new Set(allKeysData.map(k => k.key_hash));
+            for (let h of checkedHashes) {
+                if (!existingHashes.has(h)) checkedHashes.delete(h);
+            }
+
+            // 3. HTML Render
+            if (filtered.length > 0) {
+                keyBody.innerHTML = filtered.map(k => {
+                    let statusBadge = '';
+                    if (k.status === 'active') {
+                        statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>';
+                    } else if (k.status === 'rate_limited') {
+                        statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">COOLDOWN</span>';
+                    } else if (k.status === 'day_exhausted') {
+                        statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">EXHAUSTED</span>';
+                    } else if (k.status === 'invalid') {
+                        statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-slate-700/30 text-slate-500 border border-slate-700/50">INVALID</span>';
+                    } else if (k.status === 'disabled') {
+                        statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-zinc-700/30 text-zinc-500 border border-zinc-700/50">DISABLED</span>';
+                    } else {
+                        statusBadge = '<span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20">UNCHECKED</span>';
+                    }
+
+                    const limitText = k.limit <= 0 ? '<span class="text-slate-500">unknown</span>' : 
+                        ('<span class="' + (k.limit <= 10 ? 'text-rose-400 font-semibold' : 'text-slate-300') + '">' + k.limit + '</span>');
+
+                    const errPercent = k.total_requests > 0 ? (k.error_requests / k.total_requests * 100) : 0;
+                    const errText = k.total_requests > 0 ? 
+                        ('<span class="font-mono ' + (errPercent > 10.0 ? 'text-rose-400 font-semibold' : 'text-slate-400') + '">' + errPercent.toFixed(1) + '%</span>') : 
+                        '<span class="text-slate-500">-</span>';
+
+                    const isChecked = checkedHashes.has(k.key_hash) ? 'checked' : '';
+
+                    // Switch toggler
+                    const toggleBtn = k.status === 'disabled' ? 
+                        '<button onclick="performAction(\'enable\', [\'' + k.key_hash + '\'])" class="bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/20 rounded px-2 py-1 text-xs font-semibold transition" title="Включить ключ">🟢 Вкл</button>' :
+                        '<button onclick="performAction(\'disable\', [\'' + k.key_hash + '\'])" class="bg-slate-700/50 text-slate-400 hover:bg-slate-700 hover:text-white border border-slate-600 rounded px-2 py-1 text-xs font-semibold transition" title="Выключить ключ">🔴 Выкл</button>';
+
+                    return '<tr class="hover:bg-slate-750 transition ' + (k.status === 'disabled' ? 'opacity-50' : '') + '">' +
+                            '<td class="px-4 py-3 text-center">' +
+                                '<input type="checkbox" data-hash="' + k.key_hash + '" onchange="toggleKeySelect(this, \'' + k.key_hash + '\')" ' + isChecked + ' class="key-checkbox rounded bg-slate-900 border-slate-700 text-indigo-600 focus:ring-indigo-500 h-4 w-4">' +
+                            '</td>' +
+                            '<td class="px-4 py-3 font-mono text-xs text-slate-300 font-medium">' +
+                                '<span title="' + k.key_hash + '">' + k.masked_key + '</span>' +
+                            '</td>' +
+                            '<td class="px-4 py-3 text-xs">' +
+                                statusBadge +
+                            '</td>' +
+                            '<td class="px-4 py-3 text-center font-mono font-medium text-white">' + k.today_usage + '</td>' +
+                            '<td class="px-4 py-3 text-center font-mono">' +
+                                limitText +
+                            '</td>' +
+                            '<td class="px-4 py-3 text-center font-mono text-slate-400">' + k.total_requests + '</td>' +
+                            '<td class="px-4 py-3 text-center text-xs">' +
+                                errText +
+                            '</td>' +
+                            '<td class="px-4 py-3 text-center text-xs font-mono text-amber-400">' +
+                                (k.cooldown_left || '') +
+                            '</td>' +
+                            '<td class="px-4 py-3 text-center text-xs text-slate-400">' +
+                                (k.formatted_last || 'never') +
+                            '</td>' +
+                            '<td class="px-4 py-3 text-center">' +
+                                '<div class="flex items-center justify-center gap-1.5">' +
+                                    toggleBtn +
+                                    '<button onclick="performAction(\'delete\', [\'' + k.key_hash + '\'])" class="text-rose-500 hover:text-rose-400 font-bold px-2 py-1 hover:bg-rose-500/10 rounded transition text-xs">🗑️  Удалить</button>' +
+                                '</div>' +
+                            '</td>' +
+                        '</tr>';
+                }).join('');
+            } else {
+                keyBody.innerHTML = '<tr><td colspan="10" class="px-4 py-8 text-center text-slate-400">Ключи не найдены по заданным фильтрам.</td></tr>';
+            }
+
+            updateSortIndicators();
+            updateSelectAllCheckbox();
+            updateBulkBar();
+        }
+
+        // Selection Handlers
+        function toggleKeySelect(checkbox, hash) {
+            if (checkbox.checked) {
+                checkedHashes.add(hash);
+            } else {
+                checkedHashes.delete(hash);
+            }
+            updateSelectAllCheckbox();
+            updateBulkBar();
+        }
+
+        function toggleSelectAll(masterCheckbox) {
+            // Get currently rendered / filtered keys to select only those
+            const visibleCheckboxes = document.querySelectorAll('.key-checkbox');
+            visibleCheckboxes.forEach(cb => {
+                const hash = cb.getAttribute('data-hash');
+                cb.checked = masterCheckbox.checked;
+                if (masterCheckbox.checked) {
+                    checkedHashes.add(hash);
+                } else {
+                    checkedHashes.delete(hash);
+                }
+            });
+            updateBulkBar();
+        }
+
+        function updateSelectAllCheckbox() {
+            const master = document.getElementById('select-all-keys');
+            if (!master) return;
+            const visibleCheckboxes = document.querySelectorAll('.key-checkbox');
+            if (visibleCheckboxes.length === 0) {
+                master.checked = false;
+                return;
+            }
+            let allChecked = true;
+            visibleCheckboxes.forEach(cb => {
+                if (!cb.checked) allChecked = false;
+            });
+            master.checked = allChecked;
+        }
+
+        function updateBulkBar() {
+            const bar = document.getElementById('bulk-actions-bar');
+            const countSpan = document.getElementById('selected-count');
+            if (bar && countSpan) {
+                const count = checkedHashes.size;
+                countSpan.textContent = count;
+                if (count > 0) {
+                    bar.classList.remove('hidden');
+                } else {
+                    bar.classList.add('hidden');
+                }
+            }
+        }
+
+        // Sort & Filter Handlers
+        function toggleSort(col) {
+            if (sortCol === col) {
+                sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortCol = col;
+                sortOrder = 'desc'; // default to desc
+            }
+            renderKeysTable();
+        }
+
+        function setFilterStatus(status) {
+            filterStatus = status;
+            // Update active state in UI
+            const statuses = ['all', 'active', 'cooldown', 'exhausted', 'invalid', 'unchecked', 'disabled'];
+            statuses.forEach(s => {
+                const btn = document.getElementById('filter-btn-' + s);
+                if (btn) {
+                    if (s === status) {
+                        btn.className = "px-2.5 py-1.5 rounded-lg border font-semibold transition bg-indigo-600 border-indigo-500 text-white";
+                    } else {
+                        btn.className = "px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600";
+                    }
+                }
+            });
+            renderKeysTable();
+        }
+
+        function handleSearch(val) {
+            searchQuery = val;
+            renderKeysTable();
+        }
+
+        // Actions
+        async function performAction(action, hashesArray) {
+            if (hashesArray.length === 0) return;
+            if (action === 'delete' && !confirm('Вы уверены, что хотите удалить ' + hashesArray.length + ' ключ(ей)?')) {
+                return;
+            }
+
+            try {
+                const formData = new URLSearchParams();
+                hashesArray.forEach(h => formData.append('hashes', h));
+                formData.append('action', action);
+
+                const res = await fetch('/keys/bulk', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: formData.toString()
+                });
+
+                if (res.ok) {
+                    // Success, remove performed hashes from the checked set
+                    hashesArray.forEach(h => checkedHashes.delete(h));
+                    await updateStats();
+                } else {
+                    alert('Ошибка при выполнении операции на сервере.');
+                }
+            } catch (err) {
+                console.error('Action error:', err);
+                alert('Сетевая ошибка при выполнении операции.');
+            }
+        }
+
+        function bulkAction(action) {
+            const hashes = Array.from(checkedHashes);
+            performAction(action, hashes);
+        }
+
+        // Run on initial load
+        window.addEventListener('DOMContentLoaded', () => {
+            renderKeysTable();
+            setInterval(updateStats, 5000);
+        });
     </script>
 </head>
 <body class="h-full text-slate-100 flex flex-col">
@@ -642,90 +952,73 @@ const dashboardTemplate = `
 
         <!-- Detailed Account Keys Status (Bottom Section) -->
         <section class="bg-slate-800 rounded-xl border border-slate-700 overflow-hidden shadow-sm flex flex-col">
-            <div class="p-4 bg-slate-850 border-b border-slate-700 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div class="p-4 bg-slate-850 border-b border-slate-700 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                 <div>
                     <h2 class="font-bold text-white flex items-center gap-2">
                         <span>🔑</span> Детализация API ключей (Аккаунтов)
                     </h2>
                     <p class="text-xs text-slate-400">Наглядный мониторинг лимитов и ротации по 1000+ ключам</p>
                 </div>
-                <div class="flex items-center gap-2 text-xs">
+                <div class="flex flex-wrap items-center gap-2 text-xs">
                     <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Active</span>
                     <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-amber-500/10 border border-amber-500/20 text-amber-400"><span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span> Limit/Cooldown</span>
                     <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-rose-500/10 border border-rose-500/20 text-rose-400"><span class="w-1.5 h-1.5 rounded-full bg-rose-400"></span> Exhausted</span>
                     <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-slate-500/15 border border-slate-500/20 text-slate-400"><span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span> Invalid</span>
+                    <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-500/15 border border-zinc-500/20 text-zinc-400"><span class="w-1.5 h-1.5 rounded-full bg-zinc-400"></span> Disabled</span>
                 </div>
             </div>
+
+            <!-- Bulk Actions Bar -->
+            <div id="bulk-actions-bar" class="hidden bg-indigo-950/40 border-b border-slate-700 px-4 py-2.5 flex items-center justify-between gap-4 transition-all">
+                <div class="flex items-center gap-2 text-xs text-slate-300">
+                    <span class="font-bold text-indigo-400" id="selected-count">0</span> ключей выбрано
+                </div>
+                <div class="flex items-center gap-2">
+                    <button onclick="bulkAction('enable')" class="bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-semibold px-2.5 py-1 rounded text-xs transition">🟢 Включить</button>
+                    <button onclick="bulkAction('disable')" class="bg-slate-700 hover:bg-slate-600 active:bg-slate-800 text-white font-semibold px-2.5 py-1 rounded text-xs transition">🚫 Отключить</button>
+                    <button onclick="bulkAction('delete')" class="bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-semibold px-2.5 py-1 rounded text-xs transition">🗑️ Удалить</button>
+                </div>
+            </div>
+
+            <!-- Filter and Search Bar -->
+            <div class="p-4 bg-slate-850/50 border-b border-slate-700 flex flex-col md:flex-row items-center justify-between gap-4">
+                <!-- Search Input -->
+                <div class="relative w-full md:w-72">
+                    <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-500">🔍</span>
+                    <input type="text" id="search-input" oninput="handleSearch(this.value)" placeholder="Поиск по маске..." class="w-full pl-9 bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-3 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 text-slate-100 placeholder-slate-500">
+                </div>
+                <!-- Status Filter Badges -->
+                <div class="flex flex-wrap items-center gap-1.5 text-xs">
+                    <button onclick="setFilterStatus('all')" id="filter-btn-all" class="px-2.5 py-1.5 rounded-lg border font-semibold transition bg-indigo-600 border-indigo-500 text-white">Все</button>
+                    <button onclick="setFilterStatus('active')" id="filter-btn-active" class="px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600">Active</button>
+                    <button onclick="setFilterStatus('cooldown')" id="filter-btn-cooldown" class="px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600">Cooldown</button>
+                    <button onclick="setFilterStatus('exhausted')" id="filter-btn-exhausted" class="px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600">Exhausted</button>
+                    <button onclick="setFilterStatus('invalid')" id="filter-btn-invalid" class="px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600">Invalid</button>
+                    <button onclick="setFilterStatus('unchecked')" id="filter-btn-unchecked" class="px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600">Unchecked</button>
+                    <button onclick="setFilterStatus('disabled')" id="filter-btn-disabled" class="px-2.5 py-1.5 rounded-lg border font-semibold transition border-slate-700 text-slate-400 hover:text-white hover:border-slate-600">Disabled</button>
+                </div>
+            </div>
+
             <div class="overflow-x-auto max-h-[600px] overflow-y-auto">
                 <table class="w-full text-sm text-left border-collapse">
                     <thead class="bg-slate-900 text-xs uppercase tracking-wider text-slate-400 border-b border-slate-700 sticky top-0 z-10">
                         <tr>
-                            <th class="px-4 py-3">Ключ</th>
-                            <th class="px-4 py-3">Статус</th>
-                            <th class="px-4 py-3 text-center">Использовано сегодня</th>
-                            <th class="px-4 py-3 text-center">Остаток лимита</th>
-                            <th class="px-4 py-3 text-center">Всего запросов</th>
-                            <th class="px-4 py-3 text-center">Процент ошибок</th>
-                            <th class="px-4 py-3 text-center">Cooldown</th>
-                            <th class="px-4 py-3 text-center">Last Used</th>
+                            <th class="px-4 py-3 text-center w-10">
+                                <input type="checkbox" id="select-all-keys" onchange="toggleSelectAll(this)" class="rounded bg-slate-900 border-slate-700 text-indigo-600 focus:ring-indigo-500 h-4 w-4">
+                            </th>
+                            <th onclick="toggleSort('key')" class="px-4 py-3 cursor-pointer hover:bg-slate-850 select-none transition">Ключ <span id="sort-indicator-key"></span></th>
+                            <th onclick="toggleSort('status')" class="px-4 py-3 cursor-pointer hover:bg-slate-850 select-none transition">Статус <span id="sort-indicator-status"></span></th>
+                            <th onclick="toggleSort('usage')" class="px-4 py-3 text-center cursor-pointer hover:bg-slate-850 select-none transition">Использовано сегодня <span id="sort-indicator-usage"></span></th>
+                            <th onclick="toggleSort('limit')" class="px-4 py-3 text-center cursor-pointer hover:bg-slate-850 select-none transition">Остаток лимита <span id="sort-indicator-limit"></span></th>
+                            <th onclick="toggleSort('requests')" class="px-4 py-3 text-center cursor-pointer hover:bg-slate-850 select-none transition">Всего запросов <span id="sort-indicator-requests"></span></th>
+                            <th onclick="toggleSort('errors')" class="px-4 py-3 text-center cursor-pointer hover:bg-slate-850 select-none transition">Процент ошибок <span id="sort-indicator-errors"></span></th>
+                            <th onclick="toggleSort('cooldown')" class="px-4 py-3 text-center cursor-pointer hover:bg-slate-850 select-none transition">Cooldown <span id="sort-indicator-cooldown"></span></th>
+                            <th onclick="toggleSort('last_used')" class="px-4 py-3 text-center cursor-pointer hover:bg-slate-850 select-none transition">Last Used <span id="sort-indicator-last_used"></span></th>
                             <th class="px-4 py-3 text-center">Действие</th>
                         </tr>
                     </thead>
                     <tbody id="key-stats-body" class="divide-y divide-slate-700">
-                        {{range .KeyStats}}
-                        <tr class="hover:bg-slate-750 transition">
-                            <td class="px-4 py-3 font-mono text-xs text-slate-300 font-medium">
-                                <span title="{{.KeyHash}}">{{.MaskedKey}}</span>
-                            </td>
-                            <td class="px-4 py-3 text-xs">
-                                {{if eq .Status "active"}}
-                                <span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">ACTIVE</span>
-                                {{else if eq .Status "rate_limited"}}
-                                <span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">COOLDOWN</span>
-                                {{else if eq .Status "day_exhausted"}}
-                                <span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">EXHAUSTED</span>
-                                {{else if eq .Status "invalid"}}
-                                <span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-slate-700/30 text-slate-500 border border-slate-700/50">INVALID</span>
-                                {{else}}
-                                <span class="inline-flex items-center px-2 py-1 rounded-md font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20">UNCHECKED</span>
-                                {{end}}
-                            </td>
-                            <td class="px-4 py-3 text-center font-mono font-medium text-white">{{.TodayUsage}}</td>
-                            <td class="px-4 py-3 text-center font-mono">
-                                {{if le .Limit 0}}
-                                <span class="text-slate-500">unknown</span>
-                                {{else}}
-                                <span class="{{if le .Limit 10}}text-rose-400 font-semibold{{else}}text-slate-300{{end}}">{{.Limit}}</span>
-                                {{end}}
-                            </td>
-                            <td class="px-4 py-3 text-center font-mono text-slate-400">{{.TotalRequests}}</td>
-                            <td class="px-4 py-3 text-center text-xs">
-                                {{if gt .TotalRequests 0}}
-                                <span class="font-mono {{if gt (percentage .ErrorRequests .TotalRequests) 10.0}}text-rose-400 font-semibold{{else}}text-slate-400{{end}}">
-                                    {{printf "%.1f" (percentage .ErrorRequests .TotalRequests)}}%
-                                </span>
-                                {{else}}
-                                <span class="text-slate-500">-</span>
-                                {{end}}
-                            </td>
-                            <td class="px-4 py-3 text-center text-xs font-mono text-amber-400">
-                                {{cooldownLeft .CooldownUntil}}
-                            </td>
-                             <td class="px-4 py-3 text-center text-xs text-slate-400">
-                                {{formatTime .CooldownUntil}}
-                             </td>
-                             <td class="px-4 py-3 text-center">
-                                 <form action="/keys/delete" method="POST" onsubmit="return confirm('Вы уверены, что хотите удалить этот ключ?');" class="inline">
-                                     <input type="hidden" name="hash" value="{{.KeyHash}}">
-                                     <button type="submit" class="text-rose-500 hover:text-rose-400 font-bold px-2 py-1 hover:bg-rose-500/10 rounded transition text-xs">🗑️ Удалить</button>
-                                 </form>
-                             </td>
-                        </tr>
-                        {{else}}
-                        <tr>
-                            <td colspan="9" class="px-4 py-8 text-center text-slate-400">Нет загруженных ключей в пуле.</td>
-                        </tr>
-                        {{end}}
+                        <!-- Will be populated dynamically via renderKeysTable() on load and update -->
                     </tbody>
                 </table>
             </div>
