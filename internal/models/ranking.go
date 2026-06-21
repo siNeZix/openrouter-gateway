@@ -25,6 +25,13 @@ type OpenRouterModelsResponse struct {
 		ID            string `json:"id"`
 		Name          string `json:"name"`
 		ContextLength int64  `json:"context_length"`
+		Pricing       struct {
+			Prompt     string `json:"prompt"`
+			Completion string `json:"completion"`
+		} `json:"pricing"`
+		Architecture struct {
+			Modality string `json:"modality"`
+		} `json:"architecture"`
 	} `json:"data"`
 }
 
@@ -156,8 +163,13 @@ func (rm *RankingManager) fetchFree() error {
 	var dbModels []store.DBModel
 	now := time.Now()
 	for _, m := range data.Data {
-		// ponytail: we only need models with :free tag
-		if len(m.ID) > 5 && m.ID[len(m.ID)-5:] == ":free" {
+		// ponytail: free if :free suffix OR both pricing fields are exactly "0".
+		// We only want chat-compatible models ending with "->text" (excludes audio-only like lyria).
+		// Comparing string "0" is faster and safer than parsing float64.
+		isFree := (len(m.ID) > 5 && m.ID[len(m.ID)-5:] == ":free") || (m.Pricing.Prompt == "0" && m.Pricing.Completion == "0")
+		isChat := len(m.Architecture.Modality) > 6 && m.Architecture.Modality[len(m.Architecture.Modality)-6:] == "->text"
+
+		if isFree && isChat {
 			dbModels = append(dbModels, store.DBModel{
 				ID:            m.ID,
 				Name:          m.Name,
