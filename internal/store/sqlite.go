@@ -124,6 +124,12 @@ func (s *Store) migrate() error {
 			context_length INTEGER NOT NULL,
 			updated_at DATETIME NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS free_models_cache (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			context_length INTEGER NOT NULL,
+			updated_at DATETIME NOT NULL
+		);`,
 	}
 
 	for _, q := range queries {
@@ -332,6 +338,56 @@ func (s *Store) GetCachedModels() ([]DBModel, error) {
 	for rows.Next() {
 		m := DBModel{}
 		err := rows.Scan(&m.ID, &m.Name, &m.Rank, &m.ContextLength, &m.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, m)
+	}
+	return res, nil
+}
+
+func (s *Store) CacheFreeModels(models []DBModel) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec("DELETE FROM free_models_cache")
+	if err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`
+		INSERT INTO free_models_cache (id, name, context_length, updated_at)
+		VALUES (?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, m := range models {
+		_, err := stmt.Exec(m.ID, m.Name, m.ContextLength, m.UpdatedAt)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) GetCachedFreeModels() ([]DBModel, error) {
+	rows, err := s.db.Query(`SELECT id, name, context_length, updated_at FROM free_models_cache ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var res []DBModel
+	for rows.Next() {
+		m := DBModel{}
+		err := rows.Scan(&m.ID, &m.Name, &m.ContextLength, &m.UpdatedAt)
 		if err != nil {
 			return nil, err
 		}

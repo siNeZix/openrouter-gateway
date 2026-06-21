@@ -140,16 +140,15 @@ func (ph *ProxyHandler) handleModels(w http.ResponseWriter, r *http.Request) {
 		data = append(data, ModelItem{ID: "top3", Object: "model", Created: time.Now().Unix(), OwnedBy: "shir-man"})
 	}
 
-	// Add only real models containing ":free" in their ID
-	for _, m := range topModels {
-		if strings.Contains(m.ID, ":free") {
-			data = append(data, ModelItem{
-				ID:      m.ID,
-				Object:  "model",
-				Created: m.UpdatedAt.Unix(),
-				OwnedBy: strings.Split(m.ID, "/")[0],
-			})
-		}
+	// Add all free models from OpenRouter
+	freeModels := ph.rankingMgr.GetFreeModels()
+	for _, m := range freeModels {
+		data = append(data, ModelItem{
+			ID:      m.ID,
+			Object:  "model",
+			Created: m.UpdatedAt.Unix(),
+			OwnedBy: strings.Split(m.ID, "/")[0],
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json")

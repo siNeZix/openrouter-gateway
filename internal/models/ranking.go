@@ -20,20 +20,34 @@ type ShirManResponse struct {
 	} `json:"models"`
 }
 
+type OpenRouterModelsResponse struct {
+	Data []struct {
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		ContextLength int64  `json:"context_length"`
+	} `json:"data"`
+}
+
 type RankingManager struct {
 	store      *store.Store
 	refreshInt time.Duration
 
+	shirManURL    string
+	openRouterURL string
+
 	mu         sync.RWMutex
 	models     []store.DBModel
+	freeModels []store.DBModel
 	fallbackID string
 }
 
 func NewRankingManager(s *store.Store, refreshInterval time.Duration) *RankingManager {
 	return &RankingManager{
-		store:      s,
-		refreshInt: refreshInterval,
-		fallbackID: "openrouter/free",
+		store:         s,
+		refreshInt:    refreshInterval,
+		shirManURL:    "https://shir-man.com/api/free-llm/top-models",
+		openRouterURL: "https://openrouter.ai/api/v1/models",
+		fallbackID:    "openrouter/free",
 	}
 }
 
@@ -45,10 +59,19 @@ func (rm *RankingManager) Start() {
 		rm.mu.Unlock()
 		log.Printf("Loaded %d models from database cache", len(cached))
 	}
+	if cachedFree, err := rm.store.GetCachedFreeModels(); err == nil && len(cachedFree) > 0 {
+		rm.mu.Lock()
+		rm.freeModels = cachedFree
+		rm.mu.Unlock()
+		log.Printf("Loaded %d free models from database cache", len(cachedFree))
+	}
 
 	// Initial fetch
 	if err := rm.fetch(); err != nil {
 		log.Printf("Initial Shir-Man ranking fetch failed: %v", err)
+	}
+	if err := rm.fetchFree(); err != nil {
+		log.Printf("Initial OpenRouter free models fetch failed: %v", err)
 	}
 
 	// Periodical background fetch
@@ -59,13 +82,16 @@ func (rm *RankingManager) Start() {
 			if err := rm.fetch(); err != nil {
 				log.Printf("Shir-Man ranking fetch failed: %v", err)
 			}
+			if err := rm.fetchFree(); err != nil {
+				log.Printf("OpenRouter free models fetch failed: %v", err)
+			}
 		}
 	}()
 }
 
 func (rm *RankingManager) fetch() error {
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://shir-man.com/api/free-llm/top-models")
+	resp, err := client.Get(rm.shirManURL)
 	if err != nil {
 		return fmt.Errorf("failed to make HTTP request to Shir-Man API: %w", err)
 	}
@@ -110,6 +136,55 @@ func (rm *RankingManager) fetch() error {
 	return nil
 }
 
+func (rm *RankingManager) fetchFree() error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(rm.openRouterURL)
+	if err != nil {
+		return fmt.Errorf("failed to make HTTP request to OpenRouter API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad HTTP status from OpenRouter API: %s", resp.Status)
+	}
+
+	var data OpenRouterModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return fmt.Errorf("failed to decode OpenRouter models: %w", err)
+	}
+
+	var dbModels []store.DBModel
+	now := time.Now()
+	for _, m := range data.Data {
+		// ponytail: we only need models with :free tag
+		if len(m.ID) > 5 && m.ID[len(m.ID)-5:] == ":free" {
+			dbModels = append(dbModels, store.DBModel{
+				ID:            m.ID,
+				Name:          m.Name,
+				ContextLength: m.ContextLength,
+				UpdatedAt:     now,
+			})
+		}
+	}
+
+	if len(dbModels) == 0 {
+		return fmt.Errorf("OpenRouter API returned 0 free models")
+	}
+
+	// Update memory cache
+	rm.mu.Lock()
+	rm.freeModels = dbModels
+	rm.mu.Unlock()
+
+	// Cache in SQLite
+	if err := rm.store.CacheFreeModels(dbModels); err != nil {
+		log.Printf("Failed to cache free models in DB: %v", err)
+	}
+
+	log.Printf("Updated OpenRouter free models cache. Total free models: %d", len(dbModels))
+	return nil
+}
+
 func (rm *RankingManager) ResolveAlias(alias string) (string, bool) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -145,6 +220,11 @@ func (rm *RankingManager) IsFreeModel(modelID string) bool {
 			return true
 		}
 	}
+	for _, m := range rm.freeModels {
+		if m.ID == modelID {
+			return true
+		}
+	}
 	return false
 }
 
@@ -155,5 +235,14 @@ func (rm *RankingManager) GetTopModels() []store.DBModel {
 	// Return a copy to prevent race conditions or modifications
 	res := make([]store.DBModel, len(rm.models))
 	copy(res, rm.models)
+	return res
+}
+
+func (rm *RankingManager) GetFreeModels() []store.DBModel {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
+	res := make([]store.DBModel, len(rm.freeModels))
+	copy(res, rm.freeModels)
 	return res
 }
