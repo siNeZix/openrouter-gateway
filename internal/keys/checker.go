@@ -1,11 +1,14 @@
 package keys
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"openrouter-gateway/internal/store"
 )
 
 type OpenRouterKeyResponse struct {
@@ -186,19 +189,29 @@ func (kc *KeyChecker) CheckKey(ks *KeyState) {
 	switch resp.StatusCode {
 	case http.StatusOK:
 		// Update state with server data
+		var limitTotalVal, limitRemainingVal, usageVal, rateLimitReqVal sql.NullInt64
+		var rateLimitIntervalVal sql.NullString
+
 		if keyResp.Data.Limit != nil {
 			ks.MaxLimit = *keyResp.Data.Limit
+			limitTotalVal = sql.NullInt64{Int64: *keyResp.Data.Limit, Valid: true}
 		}
 		if keyResp.Data.LimitRemaining != nil {
 			ks.LimitRemaining = *keyResp.Data.LimitRemaining
+			limitRemainingVal = sql.NullInt64{Int64: *keyResp.Data.LimitRemaining, Valid: true}
+		}
+		if keyResp.Data.Usage != nil {
+			usageVal = sql.NullInt64{Int64: *keyResp.Data.Usage, Valid: true}
 		}
 		if keyResp.Data.IsFreeTier != nil {
 			ks.IsFreeTier = *keyResp.Data.IsFreeTier
 		}
 		if keyResp.Data.RateLimit != nil {
 			ks.RateLimitReq = keyResp.Data.RateLimit.Requests
+			rateLimitReqVal = sql.NullInt64{Int64: int64(keyResp.Data.RateLimit.Requests), Valid: true}
 			if keyResp.Data.RateLimit.Interval != nil {
 				ks.RateLimitInterval = *keyResp.Data.RateLimit.Interval
+				rateLimitIntervalVal = sql.NullString{String: *keyResp.Data.RateLimit.Interval, Valid: true}
 			}
 		}
 
@@ -208,6 +221,18 @@ func (kc *KeyChecker) CheckKey(ks *KeyState) {
 		} else {
 			ks.Status = "active"
 		}
+
+		// Log limit snapshot
+		kc.pool.LogRateLimit(&store.DBRateLimit{
+			Timestamp:         now,
+			KeyHash:           ks.KeyHash,
+			Source:            "checker",
+			LimitTotal:        limitTotalVal,
+			LimitRemaining:    limitRemainingVal,
+			Usage:             usageVal,
+			RateLimitReq:      rateLimitReqVal,
+			RateLimitInterval: rateLimitIntervalVal,
+		})
 
 	case http.StatusUnauthorized, http.StatusForbidden:
 		log.Printf("Key %s is INVALID (Status: %d)", masked, resp.StatusCode)

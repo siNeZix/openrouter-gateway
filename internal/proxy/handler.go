@@ -3,11 +3,13 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -240,6 +242,7 @@ func (ph *ProxyHandler) handleChatCompletions(w http.ResponseWriter, r *http.Req
 
 		// Handle key cooldown / limits based on headers and status code
 		ParseRateLimits(keyState, resp.Header)
+		ph.logProxyRateLimits(keyState, resp.Header)
 
 		if resp.StatusCode >= 400 {
 			// Read body to inspect if it's a credit/quota issue or upstream rate limit
@@ -278,12 +281,11 @@ func (ph *ProxyHandler) handleChatCompletions(w http.ResponseWriter, r *http.Req
 
 		// Success! Stream or return response
 		defer resp.Body.Close()
-		latencyMs := time.Since(startTime).Milliseconds()
 
 		if chatReq.Stream {
-			ph.handleStreamResponse(w, resp, keyState, resolvedModel, latencyMs)
+			ph.handleStreamResponse(w, resp, keyState, resolvedModel, startTime)
 		} else {
-			ph.handleNormalResponse(w, resp, keyState, resolvedModel, latencyMs)
+			ph.handleNormalResponse(w, resp, keyState, resolvedModel, startTime)
 		}
 		return
 	}
@@ -293,7 +295,7 @@ func (ph *ProxyHandler) handleChatCompletions(w http.ResponseWriter, r *http.Req
 	http.Error(w, fmt.Sprintf(`{"error":{"message":"Gateway exhausted all retries. Last error: %v"}}`, finalErr), http.StatusBadGateway)
 }
 
-func (ph *ProxyHandler) handleNormalResponse(w http.ResponseWriter, resp *http.Response, ks *keys.KeyState, model string, latencyMs int64) {
+func (ph *ProxyHandler) handleNormalResponse(w http.ResponseWriter, resp *http.Response, ks *keys.KeyState, model string, startTime time.Time) {
 	// Read body
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -325,6 +327,8 @@ func (ph *ProxyHandler) handleNormalResponse(w http.ResponseWriter, resp *http.R
 		completionTokens = usageStruct.Usage.CompletionTokens
 	}
 
+	latencyMs := time.Since(startTime).Milliseconds()
+
 	// Log request to DB
 	err = ph.store.LogRequest(&store.DBRequest{
 		Timestamp:        time.Now(),
@@ -334,13 +338,15 @@ func (ph *ProxyHandler) handleNormalResponse(w http.ResponseWriter, resp *http.R
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
 		LatencyMs:        latencyMs,
+		TTFTMs:           latencyMs, // For non-stream requests, TTFT equals total latency
+		IsStream:         false,
 	})
 	if err != nil {
 		log.Printf("Failed to log request to DB: %v", err)
 	}
 }
 
-func (ph *ProxyHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, ks *keys.KeyState, model string, latencyMs int64) {
+func (ph *ProxyHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, ks *keys.KeyState, model string, startTime time.Time) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("ResponseWriter does not support Flusher")
@@ -358,6 +364,8 @@ func (ph *ProxyHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 
 	reader := bufio.NewReader(resp.Body)
 	var promptTokens, completionTokens int
+	var ttftMs int64
+	hasLoggedTTFT := false
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -378,6 +386,12 @@ func (ph *ProxyHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 				dataJSON = strings.TrimSpace(dataJSON)
 
 				if dataJSON != "[DONE]" {
+					// Measure TTFT on the first data chunk
+					if !hasLoggedTTFT {
+						ttftMs = time.Since(startTime).Milliseconds()
+						hasLoggedTTFT = true
+					}
+
 					var usageStruct struct {
 						Usage struct {
 							PromptTokens     int `json:"prompt_tokens"`
@@ -402,6 +416,13 @@ func (ph *ProxyHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		}
 	}
 
+	// If we somehow got no chunks before EOF
+	if !hasLoggedTTFT {
+		ttftMs = time.Since(startTime).Milliseconds()
+	}
+
+	latencyMs := time.Since(startTime).Milliseconds()
+
 	// Log request to DB
 	err := ph.store.LogRequest(&store.DBRequest{
 		Timestamp:        time.Now(),
@@ -410,9 +431,45 @@ func (ph *ProxyHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		StatusCode:       resp.StatusCode,
 		PromptTokens:     promptTokens,
 		CompletionTokens: completionTokens,
-		LatencyMs:        latencyMs,
+		LatencyMs:        latencyMs, // For stream, this is now the accurate total response time
+		TTFTMs:           ttftMs,    // Time To First Token
+		IsStream:         true,
 	})
 	if err != nil {
 		log.Printf("Failed to log request to DB: %v", err)
+	}
+}
+
+func (ph *ProxyHandler) logProxyRateLimits(ks *keys.KeyState, headers http.Header) {
+	var limitTotalVal, limitRemainingVal sql.NullInt64
+	var resetRawVal sql.NullString
+
+	if limStr := headers.Get("X-RateLimit-Limit"); limStr != "" {
+		if lim, err := strconv.ParseInt(limStr, 10, 64); err == nil {
+			limitTotalVal = sql.NullInt64{Int64: lim, Valid: true}
+		}
+	}
+	if remStr := headers.Get("X-RateLimit-Remaining"); remStr != "" {
+		if rem, err := strconv.ParseInt(remStr, 10, 64); err == nil {
+			limitRemainingVal = sql.NullInt64{Int64: rem, Valid: true}
+		}
+	}
+	if resetStr := headers.Get("X-RateLimit-Reset"); resetStr != "" {
+		resetRawVal = sql.NullString{String: resetStr, Valid: true}
+	}
+
+	// Only log if we actually have some limit headers (usually at least remaining is present)
+	if limitRemainingVal.Valid || limitTotalVal.Valid || resetRawVal.Valid {
+		rl := &store.DBRateLimit{
+			Timestamp:      time.Now(),
+			KeyHash:        ks.KeyHash,
+			Source:         "proxy",
+			LimitTotal:     limitTotalVal,
+			LimitRemaining: limitRemainingVal,
+			ResetRaw:       resetRawVal,
+		}
+		if err := ph.store.LogRateLimit(rl); err != nil {
+			log.Printf("Failed to log proxy rate limit: %v", err)
+		}
 	}
 }

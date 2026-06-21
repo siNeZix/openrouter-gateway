@@ -182,6 +182,12 @@ func (kp *KeyPool) SyncKeyToDB(ks *KeyState) {
 	}
 }
 
+func (kp *KeyPool) LogRateLimit(rl *store.DBRateLimit) {
+	if err := kp.store.LogRateLimit(rl); err != nil {
+		log.Printf("Failed to log rate limit to database: %v", err)
+	}
+}
+
 func uniqueStrings(slice []string) []string {
 	keys := make(map[string]bool)
 	list := []string{}

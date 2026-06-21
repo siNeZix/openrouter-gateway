@@ -1,8 +1,10 @@
 package store_test
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"openrouter-gateway/internal/store"
 )
@@ -150,5 +152,72 @@ func TestStore_BulkOperations(t *testing.T) {
 	}
 	if len(dbKeysAfter) != 0 {
 		t.Errorf("expected 0 keys after bulk deletion, got %d", len(dbKeysAfter))
+	}
+}
+
+func TestStore_RateLimitsAndRequestsLog(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_logging.db")
+
+	s, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer s.Close()
+
+	// 1. Test LogRequest with new fields
+	reqTime := time.Now()
+	req := &store.DBRequest{
+		Timestamp:        reqTime,
+		KeyHash:          "test_hash",
+		Model:            "test_model",
+		StatusCode:       200,
+		PromptTokens:     10,
+		CompletionTokens: 20,
+		LatencyMs:        150,
+		TTFTMs:           80,
+		IsStream:         true,
+	}
+
+	if err := s.LogRequest(req); err != nil {
+		t.Fatalf("failed to LogRequest: %v", err)
+	}
+
+	// 2. Test LogRateLimit
+	limitTime := time.Now()
+	rl := &store.DBRateLimit{
+		Timestamp:         limitTime,
+		KeyHash:           "test_key_hash",
+		Source:            "proxy",
+		LimitTotal:        sql.NullInt64{Int64: 1000, Valid: true},
+		LimitRemaining:    sql.NullInt64{Int64: 950, Valid: true},
+		Usage:             sql.NullInt64{Int64: 50, Valid: true},
+		RateLimitReq:      sql.NullInt64{Int64: 20, Valid: true},
+		RateLimitInterval: sql.NullString{String: "1m", Valid: true},
+		ResetRaw:          sql.NullString{String: "60", Valid: true},
+	}
+
+	if err := s.LogRateLimit(rl); err != nil {
+		t.Fatalf("failed to LogRateLimit: %v", err)
+	}
+
+	logs, err := s.GetRateLimitsLog()
+	if err != nil {
+		t.Fatalf("failed to GetRateLimitsLog: %v", err)
+	}
+
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log entry, got %d", len(logs))
+	}
+
+	entry := logs[0]
+	if entry.KeyHash != "test_key_hash" || entry.Source != "proxy" {
+		t.Errorf("unexpected values: %+v", entry)
+	}
+	if !entry.LimitTotal.Valid || entry.LimitTotal.Int64 != 1000 {
+		t.Errorf("expected LimitTotal to be 1000, got %+v", entry.LimitTotal)
+	}
+	if !entry.RateLimitInterval.Valid || entry.RateLimitInterval.String != "1m" {
+		t.Errorf("expected RateLimitInterval to be '1m', got %+v", entry.RateLimitInterval)
 	}
 }

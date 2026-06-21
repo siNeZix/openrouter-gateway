@@ -40,6 +40,21 @@ type DBRequest struct {
 	CompletionTokens int
 	LatencyMs        int64
 	ErrorMsg         string
+	TTFTMs           int64
+	IsStream         bool
+}
+
+type DBRateLimit struct {
+	ID                int64
+	Timestamp         time.Time
+	KeyHash           string
+	Source            string // 'proxy' or 'checker'
+	LimitTotal        sql.NullInt64
+	LimitRemaining    sql.NullInt64
+	Usage             sql.NullInt64
+	RateLimitReq      sql.NullInt64
+	RateLimitInterval sql.NullString
+	ResetRaw          sql.NullString
 }
 
 type DBModel struct {
@@ -113,10 +128,26 @@ func (s *Store) migrate() error {
 			prompt_tokens INTEGER NOT NULL DEFAULT 0,
 			completion_tokens INTEGER NOT NULL DEFAULT 0,
 			latency_ms INTEGER NOT NULL DEFAULT 0,
-			error_msg TEXT
+			error_msg TEXT,
+			ttft_ms INTEGER NOT NULL DEFAULT 0,
+			is_stream INTEGER NOT NULL DEFAULT 0
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);`,
 		`CREATE INDEX IF NOT EXISTS idx_requests_key_hash ON requests(key_hash);`,
+		`CREATE TABLE IF NOT EXISTS rate_limits_log (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp DATETIME NOT NULL,
+			key_hash TEXT NOT NULL,
+			source TEXT NOT NULL,
+			limit_total INTEGER,
+			limit_remaining INTEGER,
+			usage INTEGER,
+			rate_limit_req INTEGER,
+			rate_limit_interval TEXT,
+			reset_raw TEXT
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_rl_timestamp ON rate_limits_log(timestamp);`,
+		`CREATE INDEX IF NOT EXISTS idx_rl_key_hash ON rate_limits_log(key_hash);`,
 		`CREATE TABLE IF NOT EXISTS models_cache (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -138,9 +169,11 @@ func (s *Store) migrate() error {
 		}
 	}
 
-	// Migration for databases created before raw_key existed in the CREATE above.
-	// On fresh DBs the column already exists, so this errors and is ignored.
+	// Migration for databases created before raw_key/ttft_ms/is_stream existed in the CREATE above.
+	// On fresh DBs the columns already exist, so these errors are ignored.
 	_, _ = s.db.Exec(`ALTER TABLE keys ADD COLUMN raw_key TEXT NOT NULL DEFAULT '';`)
+	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0;`)
+	_, _ = s.db.Exec(`ALTER TABLE requests ADD COLUMN is_stream INTEGER NOT NULL DEFAULT 0;`)
 
 	return nil
 }
@@ -289,10 +322,23 @@ func (s *Store) GetKeys() ([]*DBKey, error) {
 }
 
 func (s *Store) LogRequest(r *DBRequest) error {
+	isStreamInt := 0
+	if r.IsStream {
+		isStreamInt = 1
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO requests (timestamp, key_hash, model, status_code, prompt_tokens, completion_tokens, latency_ms, error_msg)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, r.Timestamp, r.KeyHash, r.Model, r.StatusCode, r.PromptTokens, r.CompletionTokens, r.LatencyMs, r.ErrorMsg)
+		INSERT INTO requests (timestamp, key_hash, model, status_code, prompt_tokens, completion_tokens, latency_ms, error_msg, ttft_ms, is_stream)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.Timestamp, r.KeyHash, r.Model, r.StatusCode, r.PromptTokens, r.CompletionTokens, r.LatencyMs, r.ErrorMsg, r.TTFTMs, isStreamInt)
+	return err
+}
+
+// ponytail: raw logs are written forever. Purging logic can be added when DB size is a concern.
+func (s *Store) LogRateLimit(rl *DBRateLimit) error {
+	_, err := s.db.Exec(`
+		INSERT INTO rate_limits_log (timestamp, key_hash, source, limit_total, limit_remaining, usage, rate_limit_req, rate_limit_interval, reset_raw)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, rl.Timestamp, rl.KeyHash, rl.Source, rl.LimitTotal, rl.LimitRemaining, rl.Usage, rl.RateLimitReq, rl.RateLimitInterval, rl.ResetRaw)
 	return err
 }
 
@@ -524,6 +570,32 @@ func (s *Store) GetKeyUsageStats() ([]KeyUsageStats, error) {
 		k.TotalRequests = totalReqs.Int64
 		k.ErrorRequests = errReqs.Int64
 		res = append(res, k)
+	}
+	return res, nil
+}
+
+func (s *Store) GetRateLimitsLog() ([]*DBRateLimit, error) {
+	rows, err := s.db.Query(`
+		SELECT id, timestamp, key_hash, source, limit_total, limit_remaining, usage, rate_limit_req, rate_limit_interval, reset_raw
+		FROM rate_limits_log
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var res []*DBRateLimit
+	for rows.Next() {
+		rl := &DBRateLimit{}
+		err := rows.Scan(
+			&rl.ID, &rl.Timestamp, &rl.KeyHash, &rl.Source, &rl.LimitTotal, &rl.LimitRemaining,
+			&rl.Usage, &rl.RateLimitReq, &rl.RateLimitInterval, &rl.ResetRaw,
+		)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, rl)
 	}
 	return res, nil
 }
